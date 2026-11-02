@@ -1,0 +1,1302 @@
+--- a/grub-core/kern/term.c
++++ b/grub-core/kern/term.c
+@@ -34,6 +34,25 @@
+ 
+ void (*grub_term_poll_usb) (int wait_for_completion) = NULL;
+ void (*grub_net_poll_cards_idle) (void) = NULL;
++void (*grub_term_poll_input_hook) (void) = NULL;
++
++void
++grub_term_poll_input (void)
++{
++  static int busy;
++  grub_err_t saved;
++  char message[GRUB_MAX_ERRMSG];
++  if (!grub_term_poll_input_hook || busy)
++    return;
++  busy = 1;
++  saved = grub_errno;
++  grub_memcpy (message, grub_errmsg, sizeof (message));
++  grub_errno = GRUB_ERR_NONE;
++  grub_term_poll_input_hook ();
++  grub_errno = saved;
++  grub_memcpy (grub_errmsg, message, sizeof (message));
++  busy = 0;
++}
+ 
+ /* Put a Unicode character.  */
+ static void
+@@ -88,6 +107,8 @@
+ {
+   grub_term_input_t term;
+ 
++  grub_term_poll_input ();
++
+   if (grub_term_poll_usb)
+     grub_term_poll_usb (0);
+ 
+--- a/include/grub/term.h
++++ b/include/grub/term.h
+@@ -329,6 +329,15 @@
+ void grub_putcode (grub_uint32_t code, struct grub_term_output *term);
+ int EXPORT_FUNC(grub_getkey) (void);
+ int EXPORT_FUNC(grub_getkey_noblock) (void);
++/* Optional cooperative input sampling. A hook must only sample/queue input,
++   never consume a key, draw, sleep, or call this function recursively. */
++#if defined (GRUB_UTIL) && !defined (GRUB_SP8_POLL_TEST)
++#define grub_term_poll_input_hook ((void (*) (void)) 0)
++static inline void grub_term_poll_input (void) { }
++#else
++extern void (*EXPORT_VAR(grub_term_poll_input_hook)) (void);
++void EXPORT_FUNC(grub_term_poll_input) (void);
++#endif
+ int EXPORT_FUNC(grub_getkeystatus) (void);
+ int EXPORT_FUNC(grub_key_is_interrupt) (int key);
+ void grub_cls (void);
+--- a/include/grub/err.h
++++ b/include/grub/err.h
+@@ -95,6 +95,8 @@
+ int EXPORT_FUNC(grub_error_pop) (void);
+ void EXPORT_FUNC(grub_print_error) (void);
+ extern int EXPORT_VAR(grub_err_printed_errors);
++/* Optional daily-menu sink. It must not allocate or alter grub_errno. */
++extern void (*EXPORT_VAR(grub_sp8_error_hook)) (grub_err_t, const char *);
+ int grub_err_printf (const char *fmt, ...)
+      __attribute__ ((format (GNU_PRINTF, 1, 2)));
+ 
+--- a/include/grub/gui.h
++++ b/include/grub/gui.h
+@@ -53,6 +53,8 @@
+   void (*get_minimal_size) (void *self, unsigned *width, unsigned *height);
+   grub_err_t (*set_property) (void *self, const char *name, const char *value);
+   void (*repaint) (void *self, int second_pass);
++  /* Optional dirty rectangle; layout/painting bounds remain unchanged. */
++  void (*get_dirty_bounds) (void *self, grub_video_rect_t *bounds);
+ };
+ 
+ struct grub_gui_container_ops
+--- a/include/grub/video_fb.h
++++ b/include/grub/video_fb.h
+@@ -30,6 +30,13 @@
+ 
+ struct grub_video_fbrender_target;
+ 
++/* Optional damage tracking for an EFI GOP shadow buffer. It has no effect
++   unless the adapter explicitly supplies its display render target. */
++void EXPORT_FUNC(grub_video_fb_track_damage) (struct grub_video_fbrender_target *target);
++int EXPORT_FUNC(grub_video_fb_peek_damage) (struct grub_video_fbrender_target *target,
++                                          grub_video_rect_t *bounds);
++void EXPORT_FUNC(grub_video_fb_clear_damage) (struct grub_video_fbrender_target *target);
++
+ #define GRUB_VIDEO_FBSTD_NUMCOLORS 16
+ #define GRUB_VIDEO_FBSTD_EXT_NUMCOLORS 256
+ 
+--- a/include/grub/gfxmenu_view.h
++++ b/include/grub/gfxmenu_view.h
+@@ -119,6 +119,7 @@
+   int nested;
+ 
+   int first_timeout;
++  int d1_timeout_prepared;
+ };
+ 
+ #endif /* ! GRUB_GFXMENU_VIEW_HEADER */
+--- a/grub-core/kern/err.c
++++ b/grub-core/kern/err.c
+@@ -27,6 +27,7 @@
+ grub_err_t grub_errno;
+ char grub_errmsg[GRUB_MAX_ERRMSG];
+ int grub_err_printed_errors;
++void (*grub_sp8_error_hook) (grub_err_t, const char *);
+ 
+ static struct grub_error_saved grub_error_stack_items[GRUB_ERROR_STACK_SIZE];
+ 
+@@ -107,6 +108,8 @@
+     {
+       if (grub_errno != GRUB_ERR_NONE)
+ 	{
++	  if (grub_sp8_error_hook)
++	    grub_sp8_error_hook (grub_errno, grub_errmsg);
+ 	  grub_err_printf (_("error: %s.\n"), grub_errmsg);
+ 	  grub_err_printed_errors++;
+ 	}
+--- a/grub-core/term/efi/console.c
++++ b/grub-core/term/efi/console.c
+@@ -23,6 +23,9 @@
+ #include <grub/efi/efi.h>
+ #include <grub/efi/api.h>
+ #include <grub/efi/console.h>
++#include <grub/env.h>
++#include <grub/time.h>
++#include <grub/command.h>
+ 
+ typedef enum {
+     GRUB_TEXT_MODE_UNDEFINED = -1,
+@@ -42,6 +45,37 @@
+ static grub_cursor_mode cursor_mode = GRUB_CURSOR_MODE_UNDEFINED;
+ static grub_term_color_state text_colorstate = GRUB_TERM_COLOR_UNDEFINED;
+ 
++static unsigned d1_console_reports;
++static grub_uint64_t d1_console_longest_ms;
++static void
++d1_console_timing (const char *operation, grub_uint64_t begin, grub_efi_status_t status)
++{
++  grub_uint64_t elapsed = grub_get_time_ms () - begin;
++  if (d1_console_reports < 2 || elapsed > d1_console_longest_ms + 20)
++    {
++      char detail[192];
++      grub_snprintf (detail, sizeof (detail), "EFI_INPUT operation=%s elapsed_ms=%llu status=0x%llx",
++                     operation, (unsigned long long) elapsed, (unsigned long long) status);
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++      d1_console_reports++;
++      d1_console_longest_ms = grub_max (d1_console_longest_ms, elapsed);
++    }
++}
++
++/* UEFI nonblocking input. In the D1 menu avoid calling an empty firmware
++   input queue: mu's OSK can display its icon as a side effect of that read. */
++static int
++d1_console_ready (grub_efi_event_t event)
++{
++  grub_efi_status_t status;
++  grub_uint64_t begin;
++  if (!grub_env_get ("sp8_daily_active") || !event) return 1;
++  begin = grub_get_time_ms ();
++  status = grub_efi_system_table->boot_services->check_event (event);
++  d1_console_timing ("CheckEvent", begin, status);
++  return status == GRUB_EFI_SUCCESS;
++}
++
+ static grub_uint32_t
+ map_char (grub_uint32_t c)
+ {
+@@ -248,7 +282,10 @@
+   grub_efi_status_t status;
+ 
+   i = grub_efi_system_table->con_in;
++  if (!d1_console_ready (i->wait_for_key)) return GRUB_TERM_NO_KEY;
++  grub_uint64_t begin = grub_get_time_ms ();
+   status = i->read_key_stroke (i, &key);
++  if (grub_env_get ("sp8_daily_active")) d1_console_timing ("ReadKeyStroke", begin, status);
+ 
+   if (status != GRUB_EFI_SUCCESS)
+     return GRUB_TERM_NO_KEY;
+@@ -276,7 +313,10 @@
+ 
+   key = grub_efi_translate_key (key_data.key);
+   if (key == GRUB_TERM_NO_KEY) {
++    if (!d1_console_ready (text_input->wait_for_key)) return GRUB_ERR_EOF;
++    grub_uint64_t begin = grub_get_time_ms ();
+     status = text_input->read_key_stroke (text_input, &key_data);
++    if (grub_env_get ("sp8_daily_active")) d1_console_timing ("ReadKeyStrokeEx", begin, status);
+     if (status != GRUB_EFI_SUCCESS)
+       return GRUB_ERR_EOF;
+ 
+--- a/grub-core/normal/menu.c
++++ b/grub-core/normal/menu.c
+@@ -297,6 +297,15 @@
+ 
+   grub_script_execute_new_scope (entry->sourcecode, entry->argc, entry->args);
+ 
++  if (grub_env_get ("sp8_daily_active"))
++    {
++      char detail[256];
++      grub_snprintf (detail, sizeof (detail), "ENTRY_SCRIPT_RETURN chosen=%s errors_printed=%d loader_loaded=%d auto_boot=%d submenu=%d",
++                     grub_env_get ("chosen") ? grub_env_get ("chosen") : "none",
++                     grub_err_printed_errors - errs_before, grub_loader_is_loaded (), auto_boot, entry->submenu);
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++    }
++
+   if (errs_before != grub_err_printed_errors)
+     grub_wait_after_message ();
+ 
+@@ -580,6 +589,7 @@
+   int default_entry, current_entry;
+   int timeout;
+   enum timeout_style timeout_style;
++  grub_uint64_t d1_frame_begin;
+ 
+   *notify_boot = 1;
+ 
+@@ -688,6 +698,7 @@
+   current_entry = default_entry;
+ 
+  refresh:
++  d1_frame_begin = grub_get_time_ms ();
+   menu_init (current_entry, menu, nested);
+ 
+   /* Initialize the time.  */
+@@ -700,6 +711,15 @@
+   else
+     clear_timeout ();
+ 
++  if (grub_env_get ("sp8_daily_active"))
++    {
++      char timing[160];
++      grub_uint64_t ready = grub_get_time_ms ();
++      grub_snprintf (timing, sizeof (timing), "MENU_INPUT_READY nested=%d frame_ms=%llu time_ms=%llu",
++                     nested, (unsigned long long) (ready - d1_frame_begin), (unsigned long long) ready);
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", timing});
++    }
++
+   while (1)
+     {
+       int c;
+@@ -789,12 +809,21 @@
+               *auto_boot = 0;
+ 	      return current_entry;
+ 
+-	    case GRUB_TERM_ESC:
++    case GRUB_TERM_ESC:
+ 	      if (nested)
+ 		{
++		  if (grub_env_get ("sp8_daily_active"))
++		    grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", (char *) "RETURN target=parent key=ESC"});
+ 		  menu_fini ();
+ 		  return -1;
+ 		}
++	      if (grub_env_get ("sp8_daily_active"))
++	        {
++	          menu_fini ();
++	          grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log-end", (char *) "return_original"});
++	          grub_command_execute ("exit", 1, (char *[]) {(char *) "0"});
++	          return -1;
++	        }
+ 	      break;
+ 
+ 	    case 'c':
+@@ -922,6 +951,19 @@
+ 					 &execution_callback, &notify_boot);
+       else
+ 	grub_menu_execute_entry (e, 0);
++      /* A queued BACK action exits just the current daily submenu. */
++      if (nested && grub_env_get ("sp8_daily_back_request"))
++        {
++          grub_env_unset ("sp8_daily_back_request");
++          break;
++        }
++      if (!nested && grub_env_get ("sp8_daily_return_request"))
++        {
++          grub_env_unset ("sp8_daily_return_request");
++          grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log-end", (char *) "return_original"});
++          grub_command_execute ("exit", 1, (char *[]) {(char *) "0"});
++          break;
++        }
+       if (autobooted)
+ 	break;
+     }
+--- a/grub-core/Makefile.core.def
++++ b/grub-core/Makefile.core.def
+@@ -2626,3 +2626,15 @@
+   efi = commands/bli.c;
+   enable = efi;
+ };
++
++module = {
++  name = sp8_gpio;
++  x86_64_efi = term/efi/sp8/sp8-grub-gpio-m1.c;
++  enable = x86_64_efi;
++};
++
++module = {
++  name = sp8_system_menu;
++  x86_64_efi = commands/sp8/sp8-system-menu-d1.c;
++  enable = x86_64_efi;
++};
+--- a/grub-core/video/efi_gop.c
++++ b/grub-core/video/efi_gop.c
+@@ -29,6 +29,10 @@
+ #include <grub/efi/efi.h>
+ #include <grub/efi/edid.h>
+ #include <grub/efi/graphics_output.h>
++#include <grub/env.h>
++#include <grub/term.h>
++#include <grub/time.h>
++#include <grub/command.h>
+ 
+ GRUB_MOD_LICENSE ("GPLv3+");
+ 
+@@ -50,6 +54,8 @@
+   struct grub_video_render_target *render_target;
+   grub_uint8_t *ptr;
+   grub_uint8_t *offscreen;
++  int track_damage;
++  unsigned present_count;
+ } framebuffer;
+ 
+ static int
+@@ -108,6 +114,7 @@
+ static grub_err_t
+ grub_video_gop_fini (void)
+ {
++  if (framebuffer.track_damage) grub_video_fb_track_damage (NULL);
+   if (restore_needed)
+     {
+       gop->set_mode (gop, old_mode);
+@@ -511,6 +518,12 @@
+       return err;
+     }
+ 
++  if (framebuffer.offscreen && grub_env_get ("sp8_daily_active"))
++    {
++      framebuffer.track_damage = 1;
++      grub_video_fb_track_damage (framebuffer.render_target);
++    }
++
+   err = grub_video_fb_set_palette (0, GRUB_VIDEO_FBSTD_NUMCOLORS,
+ 				   grub_video_fbstd_colors);
+ 
+@@ -527,6 +540,43 @@
+ {
+   if (framebuffer.offscreen)
+     {
++      if (framebuffer.track_damage)
++        {
++          grub_video_rect_t bounds;
++          grub_uint64_t begin, longest = 0;
++          unsigned row, calls = 0;
++          if (!grub_video_fb_peek_damage (framebuffer.render_target, &bounds))
++            return GRUB_ERR_NONE;
++          begin = grub_get_time_ms ();
++          for (row = 0; row < bounds.height; row += 32)
++            {
++              grub_uint64_t started;
++              grub_efi_status_t status;
++              unsigned height = grub_min (32U, bounds.height - row);
++              grub_term_poll_input ();
++              started = grub_get_time_ms ();
++              status = gop->blt (gop, framebuffer.offscreen,
++                                GRUB_EFI_BLT_BUFFER_TO_VIDEO,
++                                bounds.x, bounds.y + row, bounds.x, bounds.y + row,
++                                bounds.width, height, framebuffer.mode_info.width * 4);
++              longest = grub_max (longest, grub_get_time_ms () - started);
++              calls++;
++              if (status != GRUB_EFI_SUCCESS)
++                return grub_error (GRUB_ERR_IO, "EFI GOP blit failed");
++            }
++          grub_term_poll_input ();
++          grub_video_fb_clear_damage (framebuffer.render_target);
++          if (framebuffer.present_count++ < 6 || longest >= 100)
++            {
++              char detail[256];
++              grub_snprintf (detail, sizeof (detail), "GOP_PRESENT x=%d y=%d width=%u height=%u calls=%u total_ms=%llu max_call_ms=%llu",
++                             bounds.x, bounds.y, bounds.width, bounds.height, calls,
++                             (unsigned long long) (grub_get_time_ms () - begin),
++                             (unsigned long long) longest);
++              grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++            }
++          return GRUB_ERR_NONE;
++        }
+       gop->blt (gop, framebuffer.offscreen,
+ 		GRUB_EFI_BLT_BUFFER_TO_VIDEO, 0, 0, 0, 0,
+ 		framebuffer.mode_info.width, framebuffer.mode_info.height,
+@@ -550,6 +600,8 @@
+ {
+   grub_err_t err;
+ 
++  if (framebuffer.track_damage) grub_video_fb_track_damage (NULL);
++
+   err = grub_video_gop_fill_real_mode_info (gop->mode->mode, gop->mode->info,
+ 					    mode_info);
+   if (err)
+--- a/grub-core/video/fb/video_fb.c
++++ b/grub-core/video/fb/video_fb.c
+@@ -18,6 +18,7 @@
+ 
+ #include <grub/video.h>
+ #include <grub/video_fb.h>
++#include <grub/term.h>
+ #include <grub/misc.h>
+ #include <grub/mm.h>
+ #include <grub/fbblit.h>
+@@ -58,6 +59,32 @@
+   grub_video_fb_doublebuf_update_screen_t update_screen;
+ } framebuffer;
+ 
++static struct grub_video_fbrender_target *damage_target;
++static grub_video_rect_t damage_bounds;
++static int damage_valid;
++
++void
++grub_video_fb_track_damage (struct grub_video_fbrender_target *target)
++{
++  damage_target = target;
++  damage_valid = 0;
++}
++
++int
++grub_video_fb_peek_damage (struct grub_video_fbrender_target *target,
++                          grub_video_rect_t *bounds)
++{
++  if (target != damage_target || !damage_valid) return 0;
++  *bounds = damage_bounds;
++  return 1;
++}
++
++void
++grub_video_fb_clear_damage (struct grub_video_fbrender_target *target)
++{
++  if (target == damage_target) damage_valid = 0;
++}
++
+ /* Specify "standard" VGA palette, some video cards may
+    need this and this will also be used when using RGB modes.  */
+ struct grub_video_palette_data grub_video_fbstd_colors[GRUB_VIDEO_FBSTD_EXT_NUMCOLORS] =
+@@ -831,8 +858,26 @@
+ }
+ 
+ static void
+-dirty (int y, int height)
++dirty (int x, int y, int width, int height)
+ {
++  if (damage_target && framebuffer.render_target == damage_target && width > 0 && height > 0)
++    {
++      if (!damage_valid)
++        {
++          damage_bounds.x = x; damage_bounds.y = y;
++          damage_bounds.width = width; damage_bounds.height = height;
++          damage_valid = 1;
++        }
++      else
++        {
++          int right = grub_max ((int) damage_bounds.x + (int) damage_bounds.width, x + width);
++          int bottom = grub_max ((int) damage_bounds.y + (int) damage_bounds.height, y + height);
++          damage_bounds.x = grub_min ((int) damage_bounds.x, x);
++          damage_bounds.y = grub_min ((int) damage_bounds.y, y);
++          damage_bounds.width = right - damage_bounds.x;
++          damage_bounds.height = bottom - damage_bounds.y;
++        }
++    }
+   if (framebuffer.render_target != framebuffer.back_target)
+     return;
+   if (framebuffer.current_dirty.first_line > y)
+@@ -896,7 +941,7 @@
+   x += area_x;
+   y += area_y;
+ 
+-  dirty (y, height);
++  dirty (x, y, width, height);
+ 
+   /* Use fbblit_info to encapsulate rendering.  */
+   target.mode_info = &framebuffer.render_target->mode_info;
+@@ -1009,7 +1054,7 @@
+   target.data = framebuffer.render_target->data;
+ 
+   /* Do actual blitting.  */
+-  dirty (y, height);
++  dirty (x, y, width, height);
+   grub_video_fb_dispatch_blit (&target, source, oper, x, y, width, height,
+                                offset_x, offset_y);
+ 
+@@ -1061,8 +1106,8 @@
+   width = framebuffer.render_target->viewport.width - grub_abs (dx);
+   height = framebuffer.render_target->viewport.height - grub_abs (dy);
+ 
+-  dirty (framebuffer.render_target->viewport.y,
+-	 framebuffer.render_target->viewport.height);
++  dirty (framebuffer.render_target->viewport.x, framebuffer.render_target->viewport.y,
++         framebuffer.render_target->viewport.width, framebuffer.render_target->viewport.height);
+ 
+   if (dx < 0)
+     {
+@@ -1370,6 +1415,7 @@
+ grub_err_t
+ grub_video_fb_delete_render_target (struct grub_video_fbrender_target *target)
+ {
++  if (damage_target == target) grub_video_fb_track_damage (NULL);
+   /* If there is no target, then just return without error.  */
+   if (! target)
+     return GRUB_ERR_NONE;
+@@ -1413,6 +1459,26 @@
+   return GRUB_ERR_NONE;
+ }
+ 
++static void
++copy_framebuffer (void *destination, const void *source, grub_size_t bytes)
++{
++  char *dst = destination;
++  const char *src = source;
++  if (!grub_term_poll_input_hook)
++    {
++      grub_memcpy (dst, src, bytes);
++      return;
++    }
++  while (bytes)
++    {
++      grub_size_t count = grub_min (bytes, (grub_size_t) 65536);
++      grub_term_poll_input ();
++      grub_memcpy (dst, src, count);
++      dst += count; src += count; bytes -= count;
++    }
++  grub_term_poll_input ();
++}
++
+ static grub_err_t
+ doublebuf_blit_update_screen (void)
+ {
+@@ -1429,7 +1495,7 @@
+ 	  return GRUB_ERR_BUG;
+ 	}
+ 
+-      grub_memcpy ((char *) framebuffer.pages[0] + framebuffer.current_dirty.first_line *
++      copy_framebuffer ((char *) framebuffer.pages[0] + framebuffer.current_dirty.first_line *
+ 		   framebuffer.back_target->mode_info.pitch,
+ 		   (char *) framebuffer.back_target->data + framebuffer.current_dirty.first_line *
+ 		   framebuffer.back_target->mode_info.pitch,
+@@ -1501,7 +1567,7 @@
+ 	  return GRUB_ERR_BUG;
+ 	}
+ 
+-      grub_memcpy ((char *) framebuffer.pages[framebuffer.render_page] + first_line *
++      copy_framebuffer ((char *) framebuffer.pages[framebuffer.render_page] + first_line *
+ 		   framebuffer.back_target->mode_info.pitch,
+ 		   (char *) framebuffer.back_target->data + first_line *
+ 		   framebuffer.back_target->mode_info.pitch,
+--- a/grub-core/video/fb/fbfill.c
++++ b/grub-core/video/fb/fbfill.c
+@@ -33,6 +33,7 @@
+ #include <grub/types.h>
+ #include <grub/safemath.h>
+ #include <grub/video.h>
++#include <grub/term.h>
+ 
+ /* Generic filler that works for every supported mode.  */
+ static void
+@@ -185,6 +186,18 @@
+ 			     grub_video_color_t color, int x, int y,
+ 			     unsigned int width, unsigned int height)
+ {
++  if (grub_term_poll_input_hook && height > 16)
++    {
++      unsigned int row;
++      for (row = 0; row < height; row += 16)
++        {
++          grub_term_poll_input ();
++          grub_video_fb_fill_dispatch (target, color, x, y + row,
++                                       width, grub_min (16u, height - row));
++        }
++      grub_term_poll_input ();
++      return;
++    }
+   /* Try to figure out more optimized version.  Note that color is already
+      mapped to target format so we can make assumptions based on that.  */
+   switch (target->mode_info->bytes_per_pixel)
+--- a/grub-core/video/fb/fbblit.c
++++ b/grub-core/video/fb/fbblit.c
+@@ -33,6 +33,7 @@
+ #include <grub/misc.h>
+ #include <grub/types.h>
+ #include <grub/video.h>
++#include <grub/term.h>
+ 
+ /* Generic replacing blitter (slow).  Works for every supported format.  */
+ static void
+@@ -1936,6 +1937,21 @@
+ 			     unsigned int width, unsigned int height,
+ 			     int offset_x, int offset_y)
+ {
++  /* Let the optional GPIO sampler queue short presses during large draws.
++     All clipping/format checks still belong to the normal video path. */
++  if (grub_term_poll_input_hook && height > 16)
++    {
++      unsigned int row;
++      for (row = 0; row < height; row += 16)
++        {
++          grub_term_poll_input ();
++          grub_video_fb_dispatch_blit (target, source, oper, x, y + row,
++                                      width, grub_min (16u, height - row),
++                                      offset_x, offset_y + row);
++        }
++      grub_term_poll_input ();
++      return;
++    }
+   if (oper == GRUB_VIDEO_BLIT_REPLACE)
+     {
+       /* Try to figure out more optimized version for replace operator.  */
+--- a/grub-core/video/bitmap_scale.c
++++ b/grub-core/video/bitmap_scale.c
+@@ -24,6 +24,7 @@
+ #include <grub/bitmap_scale.h>
+ #include <grub/types.h>
+ #include <grub/dl.h>
++#include <grub/term.h>
+ 
+ GRUB_MOD_LICENSE ("GPLv3+");
+ 
+@@ -376,6 +377,7 @@
+ 
+   for (dy = 0, sy = 0, yfrac = 0; dy < dh; dy++, sy += ystep, yfrac += yover)
+     {
++      if ((dy & 15) == 0) grub_term_poll_input ();
+       if (yfrac >= dh)
+ 	{
+ 	  yfrac -= dh;
+@@ -444,6 +446,7 @@
+ 
+   for (dy = 0, syf = 0, yfrac = 0; dy < dh; dy++, syf += ystep, yfrac += yover)
+     {
++      if ((dy & 15) == 0) grub_term_poll_input ();
+       if (yfrac >= dh)
+ 	{
+ 	  yfrac -= dh;
+--- a/grub-core/gfxmenu/gfxmenu.c
++++ b/grub-core/gfxmenu/gfxmenu.c
+@@ -57,6 +57,7 @@
+   struct grub_menu_viewer *instance;
+   grub_err_t err;
+   struct grub_video_mode_info mode_info;
++  grub_uint64_t d1_begin = grub_get_time_ms (), d1_loaded, d1_drawn;
+ 
+   theme_path = grub_env_get ("theme");
+   if (! theme_path)
+@@ -100,6 +101,7 @@
+     }
+ 
+   view = cached_view;
++  d1_loaded = grub_get_time_ms ();
+ 
+   view->double_repaint = (mode_info.mode_type
+ 			  & GRUB_VIDEO_MODE_TYPE_DOUBLE_BUFFERED)
+@@ -108,6 +110,7 @@
+   view->menu = menu;
+   view->nested = nested;
+   view->first_timeout = -1;
++  view->d1_timeout_prepared = 0;
+ 
+   grub_video_set_viewport (0, 0, mode_info.width, mode_info.height);
+   if (view->double_repaint)
+@@ -117,6 +120,28 @@
+     }
+ 
+   grub_gfxmenu_view_draw (view);
++  d1_drawn = grub_get_time_ms ();
++
++  /* Read-only verification state for the separate owner M1 menu. */
++  if (grub_env_get ("sp8_m1_theme"))
++    {
++      char dimension[16];
++      grub_env_set ("sp8_m1_theme_rendered", "1");
++      grub_snprintf (dimension, sizeof (dimension), "%u", mode_info.width);
++      grub_env_set ("sp8_m1_theme_width", dimension);
++      grub_snprintf (dimension, sizeof (dimension), "%u", mode_info.height);
++      grub_env_set ("sp8_m1_theme_height", dimension);
++      if (grub_env_get ("sp8_daily_active"))
++        {
++          char detail[192];
++          grub_snprintf (detail, sizeof (detail), "FRAME_DRAWN theme_load_ms=%llu draw_ms=%llu total_ms=%llu width=%u height=%u nested=%d",
++                         (unsigned long long) (d1_loaded - d1_begin),
++                         (unsigned long long) (d1_drawn - d1_loaded),
++                         (unsigned long long) (d1_drawn - d1_begin),
++                         mode_info.width, mode_info.height, nested);
++          grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++        }
++    }
+ 
+   instance->data = view;
+   instance->set_chosen_entry = grub_gfxmenu_set_chosen_entry;
+--- a/grub-core/gfxmenu/view.c
++++ b/grub-core/gfxmenu/view.c
+@@ -23,14 +23,16 @@
+ #include <grub/mm.h>
+ #include <grub/err.h>
+ #include <grub/dl.h>
++#include <grub/term.h>
++#include <grub/command.h>
++#include <grub/env.h>
++#include <grub/time.h>
+ #include <grub/normal.h>
+ #include <grub/video.h>
+ #include <grub/gfxterm.h>
+ #include <grub/bitmap.h>
+ #include <grub/bitmap_scale.h>
+-#include <grub/term.h>
+ #include <grub/gfxwidgets.h>
+-#include <grub/time.h>
+ #include <grub/menu.h>
+ #include <grub/menu_viewer.h>
+ #include <grub/gfxmenu_view.h>
+@@ -86,6 +88,7 @@
+   default_bg_color = grub_video_rgba_color_rgb (255, 255, 255);
+ 
+   view->canvas = 0;
++  view->d1_timeout_prepared = 0;
+ 
+   view->title_font = default_font;
+   view->message_font = default_font;
+@@ -212,7 +215,10 @@
+   for (cur = grub_gfxmenu_timeout_notifications; cur; cur = cur->next)
+     {
+       grub_video_rect_t bounds;
+-      cur->self->ops->get_bounds (cur->self, &bounds);
++      if (grub_env_get ("sp8_daily_active") && cur->self->ops->get_dirty_bounds)
++        cur->self->ops->get_dirty_bounds (cur->self, &bounds);
++      else
++        cur->self->ops->get_bounds (cur->self, &bounds);
+       grub_video_set_area_status (GRUB_VIDEO_AREA_ENABLED);
+       grub_gfxmenu_view_redraw (view, &bounds);
+     }
+@@ -222,15 +228,32 @@
+ grub_gfxmenu_print_timeout (int timeout, void *data)
+ {
+   struct grub_gfxmenu_view *view = data;
++  grub_uint64_t begin = grub_get_time_ms ();
+ 
+   if (view->first_timeout == -1)
+     view->first_timeout = timeout;
+ 
+   update_timeouts (1, -view->first_timeout, -timeout, 0);
++  if (view->d1_timeout_prepared == timeout)
++    {
++      char detail[128];
++      view->d1_timeout_prepared = 0;
++      grub_snprintf (detail, sizeof (detail), "TIMEOUT_IN_FIRST_FRAME seconds=%d separate_draw=0", timeout);
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++      return; /* Already painted with the first full menu frame. */
++    }
+   redraw_timeouts (view);
+   grub_video_swap_buffers ();
+   if (view->double_repaint)
+     redraw_timeouts (view);
++  if (grub_env_get ("sp8_daily_active"))
++    {
++      char detail[192];
++      grub_snprintf (detail, sizeof (detail), "TIMEOUT_DRAW seconds=%d draw_ms=%llu time_ms=%llu",
++                     timeout, (unsigned long long) (grub_get_time_ms () - begin),
++                     (unsigned long long) grub_get_time_ms ());
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++    }
+ }
+ 
+ void
+@@ -346,19 +369,36 @@
+ 
+   init_background (view);
+ 
+-  /* Clear the screen; there may be garbage left over in video memory. */
+-  grub_video_fill_rect (grub_video_map_rgb (0, 0, 0),
++  /* A verified full-screen background already replaces every pixel. Avoid
++     clearing/flipping an extra black frame before drawing that background. */
++  if (!grub_env_get ("sp8_daily_active") || !view->scaled_desktop_image
++      || view->scaled_desktop_image->mode_info.width != view->screen.width
++      || view->scaled_desktop_image->mode_info.height != view->screen.height)
++    {
++      grub_video_fill_rect (grub_video_map_rgb (0, 0, 0),
+                         view->screen.x, view->screen.y,
+                         view->screen.width, view->screen.height);
+-  grub_video_swap_buffers ();
+-  if (view->double_repaint)
+-    grub_video_fill_rect (grub_video_map_rgb (0, 0, 0),
++      grub_video_swap_buffers ();
++      if (view->double_repaint)
++        grub_video_fill_rect (grub_video_map_rgb (0, 0, 0),
+ 			  view->screen.x, view->screen.y,
+-			  view->screen.width, view->screen.height);
++                              view->screen.width, view->screen.height);
++    }
+ 
+   refresh_menu_components (view);
+   update_menu_components (view);
+ 
++  if (grub_env_get ("sp8_daily_active"))
++    {
++      int timeout = grub_menu_get_timeout ();
++      if (timeout > 0)
++        {
++          view->first_timeout = timeout;
++          update_timeouts (1, -timeout, -timeout, 0);
++          view->d1_timeout_prepared = timeout;
++        }
++    }
++
+   grub_video_set_area_status (GRUB_VIDEO_AREA_DISABLED);
+   grub_gfxmenu_view_redraw (view, &view->screen);
+   grub_video_swap_buffers ();
+@@ -556,8 +596,16 @@
+   if (view->scaled_desktop_image)
+     return;
+ 
+-  struct grub_video_bitmap *scaled_bitmap;
+-  if (view->desktop_image_scale_method ==
++  struct grub_video_bitmap *scaled_bitmap = NULL;
++  if (grub_env_get ("sp8_daily_active") && view->raw_desktop_image
++      && view->raw_desktop_image->mode_info.width == view->screen.width
++      && view->raw_desktop_image->mode_info.height == view->screen.height
++      && view->desktop_image_scale_method == GRUB_VIDEO_BITMAP_SELECTION_METHOD_STRETCH)
++    {
++      scaled_bitmap = view->raw_desktop_image;
++      view->raw_desktop_image = NULL; /* transfer, never free an alias twice */
++    }
++  else if (view->desktop_image_scale_method ==
+       GRUB_VIDEO_BITMAP_SELECTION_METHOD_STRETCH)
+     grub_video_bitmap_create_scaled (&scaled_bitmap,
+                                      view->screen.width,
+@@ -577,6 +625,34 @@
+     return;
+   view->scaled_desktop_image = scaled_bitmap;
+ 
++  /* Cache the background in the display's byte order once. Repainting a
++     menu/timeout then uses a row copy instead of repeating per-pixel swaps.
++     The original decoded artwork stays intact for later rescaling. */
++  if (grub_env_get ("sp8_daily_active"))
++    {
++      struct grub_video_mode_info display;
++      struct grub_video_bitmap *img = view->scaled_desktop_image;
++      if (!grub_video_get_info (&display)
++          && display.blit_format == GRUB_VIDEO_BLIT_FORMAT_BGRA_8888
++          && img->mode_info.blit_format == GRUB_VIDEO_BLIT_FORMAT_RGBA_8888)
++        {
++          unsigned x, y;
++          for (y = 0; y < img->mode_info.height; y++)
++            {
++              grub_uint8_t *row = (grub_uint8_t *) img->data + y * img->mode_info.pitch;
++              if ((y & 15) == 0) grub_term_poll_input ();
++              for (x = 0; x < img->mode_info.width; x++)
++                {
++                  grub_uint8_t r = row[4 * x];
++                  row[4 * x] = row[4 * x + 2]; row[4 * x + 2] = r;
++                }
++            }
++          img->mode_info.blit_format = GRUB_VIDEO_BLIT_FORMAT_BGRA_8888;
++          img->mode_info.red_field_pos = 16;
++          img->mode_info.blue_field_pos = 0;
++        }
++    }
++
+ }
+ 
+ /* FIXME: previously notifications were displayed in special case.
+--- a/grub-core/gfxmenu/gui_list.c
++++ b/grub-core/gfxmenu/gui_list.c
+@@ -24,6 +24,8 @@
+ #include <grub/gfxmenu_view.h>
+ #include <grub/gfxwidgets.h>
+ #include <grub/color.h>
++#include <grub/env.h>
++#include <grub/command.h>
+ 
+ enum scrollbar_slice_mode {
+   SCROLLBAR_SLICE_WEST,
+@@ -37,6 +39,7 @@
+ 
+   grub_gui_container_t parent;
+   grub_video_rect_t bounds;
++  grub_video_rect_t layout_bounds;
+   char *id;
+   int visible;
+ 
+@@ -46,6 +49,10 @@
+   int item_padding;
+   int item_icon_space;
+   int item_spacing;
++  int item_text_center;
++  int item_content_center;
++  int item_block_center;
++  int d1_rows_recorded;
+   grub_font_t item_font;
+   int selected_item_font_inherit;
+   grub_font_t selected_item_font;
+@@ -349,6 +356,8 @@
+   int item_top = 0;
+   int menu_index;
+   int visible_index;
++  char rowlog[512];
++  grub_size_t rowlog_used = 0;
+   struct grub_video_rect oviewport;
+ 
+   grub_video_get_viewport (&oviewport.x, &oviewport.y,
+@@ -359,6 +368,12 @@
+ 			   oviewport.height - 2 * boxpad);
+ 
+   int cwidth = oviewport.width - 2 * boxpad;
++  if (self->item_content_center)
++    {
++      int count = grub_min (num_shown_items, self->view->menu->size - self->first_shown_index);
++      int total = count * text_box_height + grub_max (0, count - 1) * item_vspace;
++      item_top = grub_max (0, ((int) oviewport.height - 2 * boxpad - total) / 2);
++    }
+ 
+   itembox->set_content_size (itembox, cwidth - item_border_width,
+                              text_box_height);
+@@ -424,15 +439,34 @@
+         }
+ 
+       icon = get_item_icon (self, menu_index);
+-      if (icon != 0)
+-        grub_video_blit_bitmap (icon, GRUB_VIDEO_BLIT_BLEND,
+-                                max_leftpad,
+-                                item_top + icon_top_offset,
+-                                0, 0, self->icon_width, self->icon_height);
+-
+       const char *item_title =
+         grub_menu_get_entry (self->view->menu, menu_index)->title;
+ 
++      {
++        int group_left = max_leftpad;
++        if (self->item_text_center)
++          {
++            int width = grub_font_get_string_width (font, item_title);
++            int group_width = width + (icon ? self->icon_width + icon_text_space : 0);
++            group_left = grub_max (max_leftpad, (cwidth - group_width) / 2);
++            sviewport.x = group_left + (icon ? self->icon_width + icon_text_space : 0);
++            viewport_width = cwidth - sviewport.x - (is_selected ? sel_rightpad : item_rightpad);
++          }
++        if (self->item_block_center && grub_env_get ("sp8_daily_active"))
++          {
++            if (!self->d1_rows_recorded && rowlog_used + 96 < sizeof (rowlog))
++              rowlog_used += grub_snprintf (rowlog + rowlog_used, sizeof (rowlog) - rowlog_used,
++                                           "MENU_ROW nested=%d index=%d text_left=%d text_width=%d\n",
++                                           self->view->nested, menu_index,
++                                           self->bounds.x + self->menu_box->get_left_pad (self->menu_box) + boxpad + sviewport.x,
++                                           grub_font_get_string_width (font, item_title));
++          }
++        if (icon != 0)
++          grub_video_blit_bitmap (icon, GRUB_VIDEO_BLIT_BLEND,
++                                 group_left, item_top + icon_top_offset,
++                                 0, 0, self->icon_width, self->icon_height);
++      }
++
+       sviewport.y = item_top + top_pad;
+       sviewport.width = viewport_width;
+       grub_gui_set_viewport (&sviewport, &svpsave);
+@@ -448,7 +482,10 @@
+   grub_video_set_viewport (oviewport.x,
+ 			   oviewport.y,
+ 			   oviewport.width,
+-			   oviewport.height);
++                         oviewport.height);
++  if (rowlog_used)
++    grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", rowlog});
++  self->d1_rows_recorded = 1;
+ }
+ 
+ static void
+@@ -476,6 +513,20 @@
+     int box_bottom_pad = box->get_bottom_pad (box);
+     grub_video_rect_t vpsave2, content_rect;
+     int num_shown_items = get_num_shown_items (self);
++    if (grub_env_get ("sp8_daily_active"))
++      {
++        char geometry[256];
++        grub_snprintf (geometry, sizeof (geometry), "MENU_GEOMETRY left=%d top=%d width=%u height=%u screen_width=%u screen_height=%u visible=%d entries=%d text_center=%d nested=%d",
++                       self->bounds.x, self->bounds.y, self->bounds.width, self->bounds.height,
++                       self->view->screen.width, self->view->screen.height,
++                       num_shown_items, self->view->menu->size, self->item_text_center, self->view->nested);
++        /* Only changed layouts write a record; a key move does not duplicate it. */
++        if (!grub_env_get ("sp8_daily_last_geometry") || grub_strcmp (grub_env_get ("sp8_daily_last_geometry"), geometry))
++          {
++            grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", geometry});
++            grub_env_set ("sp8_daily_last_geometry", geometry);
++          }
++      }
+     int drawing_scrollbar = (self->draw_scrollbar
+ 			     && (num_shown_items < self->view->menu->size)
+ 			     && check_scrollbar (self));
+@@ -569,10 +620,50 @@
+ }
+ 
+ static void
++update_block_bounds (list_impl_t self)
++{
++  grub_gfxmenu_view_t view = self->view;
++  if (self->item_block_center && view && view->menu && self->layout_bounds.width
++      && self->layout_bounds.height && check_boxes (self))
++    {
++      grub_menu_entry_t entry;
++      int width = 0, shown, count, height;
++      grub_gfxmenu_box_t box = self->menu_box;
++      grub_gfxmenu_box_t item = self->item_box, sel = self->selected_item_box;
++      self->bounds = self->layout_bounds;
++      for (entry = view->menu->entry_list; entry; entry = entry->next)
++        {
++          width = grub_max (width, grub_font_get_string_width (self->item_font, entry->title));
++          width = grub_max (width, grub_font_get_string_width (self->selected_item_font, entry->title));
++        }
++      width += box->get_left_pad (box) + box->get_right_pad (box)
++               + grub_max (item->get_left_pad (item), sel->get_left_pad (sel))
++               + grub_max (item->get_right_pad (item), sel->get_right_pad (sel))
++               + 2 * self->item_padding + self->icon_width + self->item_icon_space;
++      shown = get_num_shown_items (self);
++      count = grub_min (view->menu->size, grub_max (1, shown));
++      height = count * self->item_height + grub_max (0, count - 1) * self->item_spacing
++               + 2 * self->item_padding + box->get_top_pad (box) + box->get_bottom_pad (box)
++               + grub_max (item->get_top_pad (item), sel->get_top_pad (sel))
++               + grub_max (item->get_bottom_pad (item), sel->get_bottom_pad (sel));
++      if (self->draw_scrollbar && shown < view->menu->size)
++        width += self->scrollbar_width + self->scrollbar_left_pad + self->scrollbar_right_pad;
++      else
++        width += self->scrollbar_left_pad;
++      self->bounds.width = grub_min ((int) self->layout_bounds.width, width);
++      self->bounds.height = grub_min ((int) self->layout_bounds.height, height);
++      self->bounds.x = self->layout_bounds.x + (self->layout_bounds.width - self->bounds.width) / 2;
++      self->bounds.y = self->layout_bounds.y + (self->layout_bounds.height - self->bounds.height) / 2;
++    }
++}
++
++static void
+ list_set_bounds (void *vself, const grub_video_rect_t *bounds)
+ {
+   list_impl_t self = vself;
+   self->bounds = *bounds;
++  self->layout_bounds = *bounds;
++  update_block_bounds (self);
+ }
+ 
+ static void
+@@ -737,6 +828,12 @@
+     {
+       self->item_spacing = grub_strtol (value, 0, 10);
+     }
++  else if (grub_strcmp (name, "item_text_align") == 0)
++    self->item_text_center = !grub_strcmp (value, "center");
++  else if (grub_strcmp (name, "item_content_align") == 0)
++    self->item_content_center = !grub_strcmp (value, "center");
++  else if (grub_strcmp (name, "item_block_align") == 0)
++    self->item_block_center = !grub_strcmp (value, "center");
+   else if (grub_strcmp (name, "visible") == 0)
+     {
+       self->visible = grub_strcmp (value, "false") != 0;
+@@ -850,6 +947,8 @@
+   grub_gfxmenu_icon_manager_set_theme_path (self->icon_manager,
+ 					    view->theme_path);
+   self->view = view;
++  update_block_bounds (self);
++
+ }
+ 
+ /* Refresh list variables */
+@@ -858,6 +957,7 @@
+                    grub_gfxmenu_view_t view)
+ {
+   list_impl_t self = vself;
++  self->d1_rows_recorded = 0;
+   if (view->nested)
+     self->first_shown_index = 0;
+ }
+--- a/grub-core/gfxmenu/gui_label.c
++++ b/grub-core/gfxmenu/gui_label.c
+@@ -24,6 +24,8 @@
+ #include <grub/gui_string_util.h>
+ #include <grub/i18n.h>
+ #include <grub/color.h>
++#include <grub/env.h>
++#include <grub/command.h>
+ 
+ static const char *align_options[] =
+ {
+@@ -53,6 +55,8 @@
+   grub_video_rgba_color_t color;
+   int value;
+   enum align_mode align;
++  int d1_geometry_recorded;
++  int dirty_text_width;
+ };
+ 
+ typedef struct grub_gui_label *grub_gui_label_t;
+@@ -114,6 +118,16 @@
+                          grub_video_map_rgba_color (self->color),
+                          left_x,
+                          grub_font_get_ascent (self->font));
++  if (!self->d1_geometry_recorded && self->id && !grub_strncmp (self->id, "sp8_footer_", 11)
++      && grub_env_get ("sp8_daily_active"))
++    {
++      char detail[384];
++      grub_snprintf (detail, sizeof (detail), "FOOTER_DRAWN id=%s left=%d top=%d width=%u text_width=%d align_center=%d",
++                     self->id, self->bounds.x, self->bounds.y, self->bounds.width,
++                     grub_font_get_string_width (self->font, self->text), self->align == align_center);
++      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++      self->d1_geometry_recorded = 1;
++    }
+   grub_gui_restore_viewport (&vpsave);
+ }
+ 
+@@ -146,6 +160,21 @@
+ }
+ 
+ static void
++label_get_dirty_bounds (void *vself, grub_video_rect_t *bounds)
++{
++  grub_gui_label_t self = vself;
++  int width, left = 0;
++  *bounds = self->bounds;
++  width = grub_min ((int) bounds->width, self->dirty_text_width);
++  if (self->align == align_center)
++    left = ((int) bounds->width - width) / 2;
++  else if (self->align == align_right)
++    left = bounds->width - width;
++  bounds->x += left;
++  bounds->width = width;
++}
++
++static void
+ label_get_minimal_size (void *vself, unsigned *width, unsigned *height)
+ {
+   grub_gui_label_t self = vself;
+@@ -161,10 +190,12 @@
+ 		 int current, int end __attribute__ ((unused)))
+ {
+   grub_gui_label_t self = vself;
++  int old_width = self->text ? grub_font_get_string_width (self->font, self->text) : 0;
+   self->value = -current;
+   self->visible = visible;
+   grub_free (self->text);
+   self->text = grub_xasprintf (self->template ? : "%d", self->value);
++  self->dirty_text_width = grub_max (old_width, grub_font_get_string_width (self->font, self->text));
+ }
+ 
+ static grub_err_t
+@@ -254,7 +285,8 @@
+   .set_bounds = label_set_bounds,
+   .get_bounds = label_get_bounds,
+   .get_minimal_size = label_get_minimal_size,
+-  .set_property = label_set_property
++  .set_property = label_set_property,
++  .get_dirty_bounds = label_get_dirty_bounds
+ };
+ 
+ grub_gui_component_t
+--- a/grub-core/gfxmenu/theme_loader.c
++++ b/grub-core/gfxmenu/theme_loader.c
+@@ -31,6 +31,99 @@
+ #include <grub/gfxmenu_view.h>
+ #include <grub/gui.h>
+ #include <grub/color.h>
++#include <grub/file.h>
++#include <grub/time.h>
++#include <grub/env.h>
++#include <grub/command.h>
++#include <grub/term.h>
++#include "sp8-background-rle.h"
++
++/* The owner's signed daily image contains its original decoded artwork as
++ * one bounded RGB stream. gzip is handled by GRUB's existing file filter.
++ * This avoids per-pixel JPEG/PNG decoding in the first interactive frame.
++ * Other themes and file types continue to use the standard readers. */
++static grub_err_t
++d1_load_background (struct grub_video_bitmap **bitmap, const char *path)
++{
++  grub_file_t file;
++  grub_uint8_t header[16];
++  const grub_size_t pixels = 1920U * 1080U * 4U;
++  grub_err_t error;
++  file = grub_file_open (path, GRUB_FILE_TYPE_PIXMAP);
++  if (!file) return grub_errno;
++  if (file->size != sizeof (header) + pixels
++      || grub_file_read (file, header, sizeof (header)) != sizeof (header)
++      || grub_memcmp (header, "SP8BG001\200\007\000\000\070\004\000\000", sizeof (header)))
++    {
++      grub_file_close (file);
++      return grub_error (GRUB_ERR_BAD_FILE_TYPE, "D1 signed background header/size refused");
++    }
++  error = grub_video_bitmap_create (bitmap, 1920, 1080, GRUB_VIDEO_BLIT_FORMAT_RGBA_8888);
++  if (!error)
++    {
++      grub_size_t done;
++      for (done = 0; done < pixels; done += 65536)
++        {
++          grub_size_t count = grub_min ((grub_size_t) 65536, pixels - done);
++          grub_term_poll_input ();
++          if (grub_file_read (file, (grub_uint8_t *) (*bitmap)->data + done, count) != (grub_ssize_t) count)
++            {
++              grub_video_bitmap_destroy (*bitmap); *bitmap = 0;
++              error = grub_error (GRUB_ERR_FILE_READ_ERROR, "D1 background read failed");
++              break;
++            }
++        }
++    }
++  grub_file_close (file);
++  return error;
++}
++
++static grub_err_t
++d1_load_native_background (struct grub_video_bitmap **bitmap, const char *path)
++{
++  grub_file_t file;
++  grub_uint8_t header[24], *buffer;
++  grub_uint32_t runs;
++  grub_size_t done = 0, bytes, left;
++  grub_err_t error;
++  const grub_size_t pixels = 2880U * 1920U;
++  *bitmap = NULL;
++  file = grub_file_open (path, GRUB_FILE_TYPE_PIXMAP);
++  if (!file) return grub_errno;
++  if (grub_file_read (file, header, sizeof (header)) != sizeof (header)
++      || grub_memcmp (header, "SP8RLE01", 8)
++      || d1_rle_u32 (header + 8) != 2880 || d1_rle_u32 (header + 12) != 1920
++      || d1_rle_u32 (header + 20) != 0
++      || !(runs = d1_rle_u32 (header + 16)) || runs > pixels
++      || file->size != sizeof (header) + (grub_uint64_t) runs * 8)
++    {
++      grub_file_close (file);
++      return grub_error (GRUB_ERR_BAD_FILE_TYPE, "D1 native background header/size refused");
++    }
++  buffer = grub_malloc (32768);
++  if (!buffer) { grub_file_close (file); return grub_errno; }
++  error = grub_video_bitmap_create (bitmap, 2880, 1920, GRUB_VIDEO_BLIT_FORMAT_RGBA_8888);
++  if (!error)
++    {
++      for (left = (grub_size_t) runs * 8; left; left -= bytes)
++        {
++          bytes = grub_min (left, (grub_size_t) 32768);
++          grub_term_poll_input ();
++          if (grub_file_read (file, buffer, bytes) != (grub_ssize_t) bytes
++              || !d1_expand_background_runs (buffer, bytes, (*bitmap)->data,
++                                             pixels, &done, grub_term_poll_input))
++            {
++              error = grub_error (GRUB_ERR_BAD_FILE_TYPE, "D1 native background run/length refused");
++              break;
++            }
++        }
++      if (!error && done != pixels)
++        error = grub_error (GRUB_ERR_BAD_FILE_TYPE, "D1 native background pixels incomplete");
++    }
++  if (error) { grub_video_bitmap_destroy (*bitmap); *bitmap = NULL; }
++  grub_free (buffer); grub_file_close (file);
++  return error;
++}
+ 
+ static grub_err_t
+ parse_proportional_spec (const char *value, signed *abs, grub_fixed_signed_t *prop);
+@@ -166,10 +259,27 @@
+     {
+       struct grub_video_bitmap *raw_bitmap;
+       char *path;
++      grub_uint64_t begin = grub_get_time_ms ();
++      grub_err_t image_error;
+       path = grub_resolve_relative_path (theme_dir, value);
+       if (! path)
+         return grub_errno;
+-      if (grub_video_bitmap_load (&raw_bitmap, path) != GRUB_ERR_NONE)
++      if (grub_env_get ("sp8_daily_active") && grub_strlen (path) >= 6
++          && !grub_strcmp (path + grub_strlen (path) - 6, ".sp8bg"))
++        {
++          struct grub_video_mode_info mode;
++          if (!grub_video_get_info (&mode) && mode.width == 2880 && mode.height == 1920)
++            {
++              char *native_path = grub_resolve_relative_path (theme_dir, "background-2880x1920.sp8rle");
++              image_error = native_path ? d1_load_native_background (&raw_bitmap, native_path) : grub_errno;
++              grub_free (native_path);
++            }
++          else
++            image_error = d1_load_background (&raw_bitmap, path);
++        }
++      else
++        image_error = grub_video_bitmap_load (&raw_bitmap, path);
++      if (image_error != GRUB_ERR_NONE)
+         {
+           grub_free (path);
+           return grub_errno;
+@@ -177,6 +287,14 @@
+       grub_free(path);
+       grub_video_bitmap_destroy (view->raw_desktop_image);
+       view->raw_desktop_image = raw_bitmap;
++      if (grub_env_get ("sp8_daily_active"))
++        {
++          char detail[128];
++          grub_snprintf (detail, sizeof (detail), "BACKGROUND_READY decode_ms=%llu pixels=%ux%u",
++                         (unsigned long long) (grub_get_time_ms () - begin),
++                         raw_bitmap->mode_info.width, raw_bitmap->mode_info.height);
++          grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
++        }
+     }
+   else if (! grub_strcmp ("desktop-image-scale-method", name))
+     {

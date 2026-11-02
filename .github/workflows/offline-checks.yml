@@ -1,0 +1,13 @@
+name: Offline checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tools/check.py
+      - run: python3 grub-buttons/prepare-source.py build/ci-source
+

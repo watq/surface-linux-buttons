@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface short power key locks and blanks the display without suspend
+After=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/surface-screen-key.py --user @USER@
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/surface-screen-key.py --restore-backlight
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

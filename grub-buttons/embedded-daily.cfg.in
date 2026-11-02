@@ -1,0 +1,71 @@
+# SP8 DAILY D1. Original default EFI stays intact; current system entries are imported.
+set sp8_daily_quiet=1
+export sp8_daily_quiet
+set sp8_daily_active=1
+export sp8_daily_active
+set sp8_daily_skip=1
+export sp8_daily_skip
+terminal_input console
+terminal_output console
+sp8_gpio log-start
+sp8_gpio log BUILD=surface-buttons-public-d1
+sp8_gpio log DAILY_ENTRY
+if sp8_gpio on; then
+  terminal_input --append sp8_gpio
+  sp8_gpio log GPIO_TERMINAL_APPENDED
+else
+  echo D1_GPIO_REFUSED_KEYBOARD_AVAILABLE
+  sp8_gpio log GPIO_REFUSED_KEYBOARD_AVAILABLE
+fi
+if search --no-floppy --fs-uuid --set=sp8_daily_root @ROOT_UUID@; then
+  sp8_gpio log ROOT_FOUND
+else
+  sp8_gpio log-end root_not_found
+  exit 0
+fi
+set root=$sp8_daily_root
+set config_directory=($sp8_daily_root)/boot/grub
+export config_directory
+# Import the real grubenv and use the installed locale directory. All runtime
+# loader modules used by this machine are already embedded in the signed EFI.
+set sp8_daily_embed_prefix=$prefix
+set prefix=($sp8_daily_root)/boot/grub
+set sp8f=(memdisk)/boot/grub/fonts/unicode.pf2
+if sp8_system_menu load ($sp8_daily_root)/boot/grub/grub.cfg; then
+  sp8_gpio log CURRENT_SYSTEM_CONFIG_LOADED
+else
+  echo D1_CONFIG_IMPORT_REFUSED_RETURN_ORIGINAL
+  sp8_gpio log-end config_import_failed
+  exit 0
+fi
+# Keep the system prefix for recordfail/save_env and future kernel helpers.
+# Keep current default selection, but show the menu and preserve the user's 15-second wait.
+set timeout_style=menu
+if [ -z "$timeout" ]; then
+  set timeout=15
+fi
+if loadfont $sp8_daily_embed_prefix/themes/Vimix/surface-readable-24.pf2; then
+  insmod all_video
+  insmod gfxterm
+  insmod gfxmenu
+  insmod png
+  insmod jpeg
+  loadfont $sp8_daily_embed_prefix/themes/Vimix/surface-readable-20.pf2
+  loadfont $sp8_daily_embed_prefix/themes/Vimix/surface-readable-28.pf2
+  if [ -z "$gfxmode" ]; then
+    set gfxmode=auto
+  fi
+  set gfxterm_font="Surface Readable Regular 24"
+  export gfxterm_font
+  set sp8_m1_theme=Vimix
+  if terminal_output gfxterm; then
+    sp8_system_menu layout
+    sp8_gpio log GRAPHICS_TERMINAL_ACTIVE
+  else
+    terminal_output console
+    unset theme
+    echo D1_GRAPHICS_FALLBACK
+    sp8_gpio log GRAPHICS_FALLBACK
+  fi
+fi
+sp8_gpio log MENU_READY

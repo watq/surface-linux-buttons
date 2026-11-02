@@ -1,0 +1,28 @@
+{
+  "date": "2026-11-02",
+  "device": "Surface Pro 8",
+  "desktop": "GNOME Wayland",
+  "linux_power_source_sha256": "9e492d640363253608e7a789f3c3a82a13ece269934e791ed27ab15c65f9dd49",
+  "accepted_grub_image_sha256": "3ece1899e09b6926ad9dfd86ed3421b2b27e526eb42fa147b8637f0c83058f5c",
+  "user_report": "Volume selection and power confirmation work; other acceptance passed; brief startup stutter remains.",
+  "publication": "Source snapshot of accepted 2026-10-30 GRUB, not the subsequent in-progress latency fix.",
+  "power_evidence": {
+    "physical_short_press_display_off_mode": 3,
+    "network_connected_and_ssh_alive": true,
+    "lock_confirmed": true,
+    "historical_test_kernel": "7.2.12-1-surface",
+    "maintenance_signal_check_separate_from_physical": true
+  },
+  "source_archive_sha256": "f3c97391f7c4eaa677a78e090c7e97e6dc47b16f655f04683ebd37bef7fe0faa",
+  "public_offline_validation": {
+    "python_and_publication_tests": 7,
+    "ubuntu_patch_application_passed": true,
+    "full_x86_64_configure_and_make_passed": true,
+    "unsigned_efi_build_passed": true,
+    "unsigned_efi_bytes": 6213632,
+    "unsigned_efi_sha256": "c48c6a559872c2c063024af610384095abba83118580f7d023bb4aa57a7b83b3",
+    "EFI_console_and_GOP_host_fixtures_passed": true,
+    "signing_of_public_build_performed": false,
+    "public_build_booted_on_hardware": false
+  }
+}
