@@ -29,6 +29,7 @@
 #include <grub/efi/efi.h>
 #include <grub/efi/edid.h>
 #include <grub/efi/graphics_output.h>
+#include <grub/efi/sp8_swm.h>
 #include <grub/env.h>
 #include <grub/term.h>
 #include <grub/time.h>
@@ -114,6 +115,7 @@ grub_video_gop_init (void)
 static grub_err_t
 grub_video_gop_fini (void)
 {
+  grub_efi_console_release_swm ();
   if (framebuffer.track_damage) grub_video_fb_track_damage (NULL);
   if (restore_needed)
     {
@@ -522,6 +524,7 @@ grub_video_gop_setup (unsigned int width, unsigned int height,
     {
       framebuffer.track_damage = 1;
       grub_video_fb_track_damage (framebuffer.render_target);
+      grub_efi_console_swm_surface (framebuffer.mode_info.width, framebuffer.mode_info.height);
     }
 
   err = grub_video_fb_set_palette (0, GRUB_VIDEO_FBSTD_NUMCOLORS,
@@ -548,6 +551,30 @@ grub_video_gop_swap_buffers (void)
           if (!grub_video_fb_peek_damage (framebuffer.render_target, &bounds))
             return GRUB_ERR_NONE;
           begin = grub_get_time_ms ();
+          if (grub_efi_console_swm_surface (framebuffer.mode_info.width, framebuffer.mode_info.height))
+            {
+              char detail[256]; grub_efi_status_t status; grub_uint64_t started;
+              /* One compositor transaction per damage rectangle. Splitting a
+                 full screen into 60 GOP writes makes SRE restore/capture the
+                 entire OSK surface 60 times, starving input and erasing it. */
+              grub_term_poll_input (); started = grub_get_time_ms ();
+              status = grub_efi_console_swm_blt ((struct grub_efi_gop_blt_pixel *) framebuffer.offscreen,
+                                                bounds.x, bounds.y, bounds.width, bounds.height,
+                                                framebuffer.mode_info.width * 4);
+              longest = grub_get_time_ms () - started;
+              grub_term_poll_input ();
+              if (status != GRUB_EFI_SUCCESS) return grub_error (GRUB_ERR_IO, "EFI SWM blit failed");
+              grub_video_fb_clear_damage (framebuffer.render_target);
+              if (framebuffer.present_count++ < 6 || longest >= 100
+                  || bounds.width == framebuffer.mode_info.width)
+                {
+                  grub_snprintf (detail, sizeof (detail), "GOP_PRESENT x=%d y=%d width=%u height=%u calls=1 total_ms=%llu max_call_ms=%llu route=SWM OSK_preserved=1",
+                                 bounds.x, bounds.y, bounds.width, bounds.height,
+                                 (unsigned long long) (grub_get_time_ms () - begin), (unsigned long long) longest);
+                  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+                }
+              return GRUB_ERR_NONE;
+            }
           for (row = 0; row < bounds.height; row += 32)
             {
               grub_uint64_t started;
@@ -566,7 +593,8 @@ grub_video_gop_swap_buffers (void)
             }
           grub_term_poll_input ();
           grub_video_fb_clear_damage (framebuffer.render_target);
-          if (framebuffer.present_count++ < 6 || longest >= 100)
+          if (framebuffer.present_count++ < 6 || longest >= 100
+              || bounds.width == framebuffer.mode_info.width)
             {
               char detail[256];
               grub_snprintf (detail, sizeof (detail), "GOP_PRESENT x=%d y=%d width=%u height=%u calls=%u total_ms=%llu max_call_ms=%llu",
@@ -599,6 +627,7 @@ grub_video_gop_get_info_and_fini (struct grub_video_mode_info *mode_info,
 				  void **framebuf)
 {
   grub_err_t err;
+  grub_efi_console_release_swm ();
 
   if (framebuffer.track_damage) grub_video_fb_track_damage (NULL);
 

@@ -429,6 +429,7 @@ redraw_menu_visit (grub_gui_component_t component,
 void
 grub_gfxmenu_redraw_menu (grub_gfxmenu_view_t view)
 {
+  grub_uint64_t begin = grub_get_time_ms ();
   update_menu_components (view);
 
   grub_gui_iterate_recursively ((grub_gui_component_t) view->canvas,
@@ -438,6 +439,13 @@ grub_gfxmenu_redraw_menu (grub_gfxmenu_view_t view)
     {
       grub_gui_iterate_recursively ((grub_gui_component_t) view->canvas,
 				    redraw_menu_visit, view);
+    }
+  if (grub_env_get ("sp8_daily_active") && grub_get_time_ms () - begin > 100)
+    {
+      char detail[160];
+      grub_snprintf (detail, sizeof (detail), "MENU_REDRAW total_ms=%llu original_OSK_preserved=1",
+                     (unsigned long long) (grub_get_time_ms () - begin));
+      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
     }
 }
 

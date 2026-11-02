@@ -743,7 +743,22 @@ run_menu (grub_menu_t menu, int nested, int *auto_boot, int *notify_boot)
 	  return default_entry;
 	}
 
-      c = grub_getkey_noblock ();
+      if (grub_env_get ("sp8_daily_active"))
+        {
+          grub_uint64_t input_begin = grub_get_time_ms ();
+          c = grub_getkey_noblock ();
+          grub_uint64_t input_ms = grub_get_time_ms () - input_begin;
+          if (input_ms > 100)
+            {
+              char detail[224];
+              grub_snprintf (detail, sizeof (detail),
+                             "INPUT_DISPATCH total_ms=%llu key_class=%s firmware_and_logging_included=1",
+                             (unsigned long long) input_ms,
+                             c == GRUB_TERM_NO_KEY ? "none" : "accepted");
+              grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+            }
+        }
+      else c = grub_getkey_noblock ();
 
       /* Negative values are returned on error. */
       if ((c != GRUB_TERM_NO_KEY) && (c > 0))
@@ -939,18 +954,33 @@ show_menu (grub_menu_t menu, int nested, int autobooted)
       e = grub_menu_get_entry (menu, boot_entry);
       if (! e)
 	continue; /* Menu is empty.  */
+      if (!e->submenu && grub_env_get ("sp8_daily_active"))
+        grub_command_execute ("sp8_gpio", 1, (char *[]) {(char *) "prepare-entry"});
 
 #if QUIET_BOOT
       /* Only clear the screen if we drew the menu in the first place.  */
       if (initial_timeout != 0)
 #endif
-	grub_cls ();
+        {
+          grub_uint64_t clear_begin = grub_get_time_ms ();
+          grub_cls ();
+          if (grub_env_get ("sp8_daily_active"))
+            {
+              char detail[160];
+              grub_snprintf (detail, sizeof (detail), "ENTRY_CLEAR total_ms=%llu submenu=%d prepare_entry_hook_invoked=%u",
+                             (unsigned long long) (grub_get_time_ms () - clear_begin),
+                             e->submenu, !e->submenu);
+              grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+            }
+        }
 
       if (auto_boot)
 	grub_menu_execute_with_fallback (menu, e, autobooted,
 					 &execution_callback, &notify_boot);
       else
 	grub_menu_execute_entry (e, 0);
+      if (!e->submenu && grub_env_get ("sp8_daily_active"))
+        grub_command_execute ("sp8_gpio", 1, (char *[]) {(char *) "resume-entry"});
       /* A queued BACK action exits just the current daily submenu. */
       if (nested && grub_env_get ("sp8_daily_back_request"))
         {

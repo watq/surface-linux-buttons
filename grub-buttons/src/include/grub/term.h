@@ -331,11 +331,18 @@ int EXPORT_FUNC(grub_getkey) (void);
 int EXPORT_FUNC(grub_getkey_noblock) (void);
 /* Optional cooperative input sampling. A hook must only sample/queue input,
    never consume a key, draw, sleep, or call this function recursively. */
+typedef void (*grub_term_input_trace_t) (const char *phase, const char *name,
+                                        grub_uint64_t begin_ms, grub_uint64_t end_ms,
+                                        int key);
 #if defined (GRUB_UTIL) && !defined (GRUB_SP8_POLL_TEST)
 #define grub_term_poll_input_hook ((void (*) (void)) 0)
+#define grub_term_input_trace_hook ((grub_term_input_trace_t) 0)
 static inline void grub_term_poll_input (void) { }
 #else
 extern void (*EXPORT_VAR(grub_term_poll_input_hook)) (void);
+/* Optional observer of completed slow input operations. It never changes
+   the input order or consumes events; absent observers incur no clock reads. */
+extern grub_term_input_trace_t EXPORT_VAR(grub_term_input_trace_hook);
 void EXPORT_FUNC(grub_term_poll_input) (void);
 #endif
 int EXPORT_FUNC(grub_getkeystatus) (void);

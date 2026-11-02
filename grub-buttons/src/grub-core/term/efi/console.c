@@ -23,6 +23,8 @@
 #include <grub/efi/efi.h>
 #include <grub/efi/api.h>
 #include <grub/efi/console.h>
+#include <grub/efi/graphics_output.h>
+#include <grub/efi/sp8_swm.h>
 #include <grub/env.h>
 #include <grub/time.h>
 #include <grub/command.h>
@@ -45,30 +47,431 @@ static grub_text_mode text_mode = GRUB_TEXT_MODE_UNDEFINED;
 static grub_cursor_mode cursor_mode = GRUB_CURSOR_MODE_UNDEFINED;
 static grub_term_color_state text_colorstate = GRUB_TERM_COLOR_UNDEFINED;
 
-static unsigned d1_console_reports;
-static grub_uint64_t d1_console_longest_ms;
+static unsigned d1_console_reports[3];
+static grub_uint64_t d1_console_longest_ms[3];
+static grub_uint64_t d1_console_calls[3], d1_console_leaf_calls, d1_console_idle_polls;
+static grub_uint64_t d1_console_navigation_keys;
+static grub_uint64_t d1_console_queries, d1_console_query_ms, d1_console_query_longest;
+static unsigned d1_console_query_reports;
+static grub_uint64_t d1_console_service_calls, d1_console_service_ms, d1_console_service_longest;
+static unsigned d1_console_service_reports;
+static grub_efi_handle_t d1_console_cached_input_handle;
+static unsigned d1_console_cached_leaf_input;
+static int d1_console_direct_poll;
+static grub_efi_key_data_t d1_console_key_data;
+struct d1_console_leaf_state
+{
+  struct grub_efi_console_leaf input;
+  grub_efi_key_data_t key;
+  unsigned pending, reports;
+  grub_uint64_t longest_ms;
+  grub_uint64_t last_poll_ms;
+  unsigned has_polled;
+  unsigned cycle_reports;
+  unsigned slow_cycle_mask;
+  grub_uint64_t longest_cycle_ms;
+};
+static struct d1_console_leaf_state d1_console_leaves[GRUB_EFI_CONSOLE_MAX_LEAVES];
+static unsigned d1_console_leaf_count, d1_console_next_leaf;
+static unsigned d1_console_leaf_generation;
+static int d1_console_empty_input_idle;
+static struct grub_efi_swm *d1_swm;
+static struct grub_efi_swm d1_swm_calls;
+static unsigned d1_swm_registered, d1_swm_width, d1_swm_height, d1_swm_attempted;
+static grub_efi_event_t d1_swm_paint;
+static unsigned d1_swm_blits;
+
+void
+grub_efi_console_release_swm (void)
+{
+  if (d1_swm_registered && !grub_efi_is_finished)
+    {
+      char detail[160]; grub_uint64_t begin = grub_get_time_ms ();
+      grub_efi_status_t status = d1_swm_calls.unregister_client (d1_swm, grub_efi_image_handle);
+      if (status == GRUB_EFI_SUCCESS && d1_swm_paint
+          && grub_efi_system_table->boot_services->close_event)
+        grub_efi_system_table->boot_services->close_event (d1_swm_paint);
+      grub_snprintf (detail, sizeof (detail), "SWM_CLIENT_RELEASE own_GRUB_client_only=1 status=0x%llx elapsed_ms=%llu blits=%u",
+                     (unsigned long long) status, (unsigned long long) (grub_get_time_ms () - begin), d1_swm_blits);
+      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+    }
+  d1_swm_registered = d1_swm_attempted = 0; d1_swm = NULL; d1_swm_paint = NULL;
+}
+
+void
+grub_efi_console_configure_swm (struct grub_efi_swm *protocol, const struct grub_efi_swm *copy)
+{
+  grub_efi_console_release_swm ();
+  if (!protocol || !copy) return;
+  d1_swm = protocol; d1_swm_calls = *copy; d1_swm_blits = 0;
+}
+
+int
+grub_efi_console_swm_surface (unsigned width, unsigned height)
+{
+  struct grub_efi_swm_rect rect;
+  grub_efi_status_t status; grub_uint64_t begin; void *unused_pointer = NULL; char detail[192];
+  if (!d1_swm || grub_efi_is_finished || !grub_env_get ("sp8_daily_active") || !width || !height) return 0;
+  if (d1_swm_registered && width == d1_swm_width && height == d1_swm_height) return 1;
+  if (!d1_swm_registered && d1_swm_attempted) return 0;
+  rect = (struct grub_efi_swm_rect) {0, 0, width - 1, height - 1}; begin = grub_get_time_ms ();
+  if (d1_swm_registered)
+    status = d1_swm_calls.set_window_frame (d1_swm, grub_efi_image_handle, &rect);
+  else
+    {
+      d1_swm_attempted = 1;
+      status = d1_swm_calls.register_client (d1_swm, grub_efi_image_handle, 0x10, &rect,
+                                             NULL, NULL, &unused_pointer, &d1_swm_paint);
+    }
+  if (status == GRUB_EFI_SUCCESS)
+    { d1_swm_registered = 1; d1_swm_width = width; d1_swm_height = height; }
+  grub_snprintf (detail, sizeof (detail), "SWM_CLIENT_SURFACE width=%u height=%u active=0 z_order=16 OSK_above=1 status=0x%llx elapsed_ms=%llu",
+                 width, height, (unsigned long long) status, (unsigned long long) (grub_get_time_ms () - begin));
+  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+  return status == GRUB_EFI_SUCCESS;
+}
+
+grub_efi_status_t
+grub_efi_console_swm_blt (struct grub_efi_gop_blt_pixel *buffer, unsigned x, unsigned y,
+                         unsigned width, unsigned height, unsigned pitch)
+{
+  if (!d1_swm_registered || !d1_swm || grub_efi_is_finished) return GRUB_EFI_UNSUPPORTED;
+  d1_swm_blits++;
+  return d1_swm_calls.blt_window (d1_swm, grub_efi_image_handle, buffer, GRUB_EFI_BLT_BUFFER_TO_VIDEO,
+                                 x, y, x, y, width, height, pitch);
+}
+
+void
+grub_efi_console_set_direct_poll (int enabled)
+{
+  if (enabled && !d1_console_direct_poll)
+    {
+      grub_memset (d1_console_calls, 0, sizeof (d1_console_calls));
+      d1_console_leaf_calls = d1_console_idle_polls = 0;
+      d1_console_navigation_keys = 0;
+      d1_console_queries = d1_console_query_ms = d1_console_query_longest = 0;
+      d1_console_query_reports = 0;
+      d1_console_service_calls = d1_console_service_ms = d1_console_service_longest = 0;
+      d1_console_service_reports = 0;
+    }
+  d1_console_direct_poll = !!enabled;
+}
+
+void
+grub_efi_console_log_input_summary (void)
+{
+  char detail[256];
+  grub_snprintf (detail, sizeof (detail),
+                 "EFI_INPUT_SUMMARY CheckEvent_calls=%llu aggregate_Basic_reads=%llu aggregate_Ex_reads=%llu leaf_reads=%llu empty_polls=%llu EFI_navigation_keys=%llu",
+                 (unsigned long long) d1_console_calls[0],
+                 (unsigned long long) d1_console_calls[1],
+                 (unsigned long long) d1_console_calls[2],
+                 (unsigned long long) d1_console_leaf_calls,
+                 (unsigned long long) d1_console_idle_polls,
+                 (unsigned long long) d1_console_navigation_keys);
+  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+  grub_snprintf (detail, sizeof (detail),
+                 "EFI_INPUT_QUERY_SUMMARY live_queries=%llu query_total_ms=%llu query_max_ms=%llu agent_tracking=0 stale_protocol_cache=0 poll_interval_ms=5",
+                 (unsigned long long) d1_console_queries,
+                 (unsigned long long) d1_console_query_ms,
+                 (unsigned long long) d1_console_query_longest);
+  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+  grub_snprintf (detail, sizeof (detail),
+                 "EFI_INPUT_SERVICE_SUMMARY calls=%llu total_ms=%llu max_ms=%llu callbacks_preserved=1 total_wait_not_excluded=1",
+                 (unsigned long long) d1_console_service_calls,
+                 (unsigned long long) d1_console_service_ms,
+                 (unsigned long long) d1_console_service_longest);
+  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+}
+
+/* Let the original firmware dispatch pending input/OSK/SWM callbacks at a
+   measured boundary. Raise and immediately restore: no read/query/blit is
+   performed at raised TPL, no timer is cancelled, and no pointer queue is
+   consumed here. This does not eliminate a slow firmware callback; its
+   duration stays in the same complete console-cycle time and GPIO gap. */
+static void
+d1_console_service_callbacks (void)
+{
+  grub_efi_boot_services_t *bs = grub_efi_system_table->boot_services;
+  grub_efi_tpl_t previous;
+  grub_uint64_t begin, elapsed;
+  if (grub_efi_is_finished || !bs->raise_tpl || !bs->restore_tpl) return;
+  begin = grub_get_time_ms ();
+  previous = bs->raise_tpl (GRUB_EFI_TPL_NOTIFY);
+  bs->restore_tpl (previous);
+  elapsed = grub_get_time_ms () - begin;
+  d1_console_service_calls++; d1_console_service_ms += elapsed;
+  if (d1_console_service_reports < 2 || elapsed > d1_console_service_longest + 20)
+    {
+      char detail[224];
+      grub_snprintf (detail, sizeof (detail),
+                     "EFI_INPUT_SERVICE operation=RestoreTPL previous_tpl=%llu elapsed_ms=%llu callbacks_preserved=1 total_wait_not_excluded=1",
+                     (unsigned long long) previous, (unsigned long long) elapsed);
+      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+      d1_console_service_reports++;
+    }
+  d1_console_service_longest = grub_max (d1_console_service_longest, elapsed);
+}
+
+/* GET_PROTOCOL with a NULL agent is a live query of the same protocol
+   database. EDK2 does not allocate/increment an agent OpenList item for it.
+   GET_PROTOCOL with GRUB's image handle is not a lifetime pin: uninstall
+   is allowed to discard that OpenList item. Keep the live check on every
+   scheduled read, including USB hotplug, rather than cache a stale pointer.
+   Stay at the caller's TPL so firmware OSK/SWM callbacks remain serviced.
+   A long query can include firmware callback work; total timing is retained
+   and is not claimed to be the protocol lookup's intrinsic cost. */
+void *
+grub_efi_console_query_input_protocol (grub_efi_handle_t handle, int extended)
+{
+  static grub_guid_t ex_guid = GRUB_EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
+  static grub_guid_t basic_guid = GRUB_EFI_SIMPLE_TEXT_INPUT_PROTOCOL_GUID;
+  grub_efi_boot_services_t *bs = grub_efi_system_table->boot_services;
+  grub_efi_status_t status;
+  grub_uint64_t begin, elapsed;
+  void *protocol = NULL;
+  if (grub_efi_is_finished || !handle || !bs->open_protocol) return NULL;
+  begin = grub_get_time_ms ();
+  status = bs->open_protocol (handle, extended ? &ex_guid : &basic_guid,
+                              &protocol, NULL, NULL,
+                              GRUB_EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+  elapsed = grub_get_time_ms () - begin;
+  if (d1_console_direct_poll && grub_env_get ("sp8_daily_active"))
+    {
+      d1_console_queries++; d1_console_query_ms += elapsed;
+      if (d1_console_query_reports < 2 || elapsed > d1_console_query_longest + 20)
+        {
+          char detail[256];
+          grub_snprintf (detail, sizeof (detail),
+                         "EFI_INPUT_QUERY handle=0x%llx kind=%s elapsed_ms=%llu status=0x%llx agent_tracking=0 callbacks_included=1",
+                         (unsigned long long) (grub_addr_t) handle, extended ? "Ex" : "Basic",
+                         (unsigned long long) elapsed, (unsigned long long) status);
+          grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+          d1_console_query_reports++;
+        }
+      d1_console_query_longest = grub_max (d1_console_query_longest, elapsed);
+    }
+  return status == GRUB_EFI_SUCCESS ? protocol : NULL;
+}
+
+void
+grub_efi_console_set_empty_input_policy (int enabled)
+{
+  d1_console_empty_input_idle = !!enabled;
+}
+
+void
+grub_efi_console_set_leaf_inputs (unsigned count,
+                                const struct grub_efi_console_leaf *inputs)
+{
+  struct d1_console_leaf_state saved[GRUB_EFI_CONSOLE_MAX_LEAVES];
+  unsigned i, j;
+  if (count > GRUB_EFI_CONSOLE_MAX_LEAVES || (count && !inputs)) return;
+  grub_memcpy (saved, d1_console_leaves, sizeof (saved));
+  grub_memset (d1_console_leaves, 0, sizeof (d1_console_leaves));
+  for (i = 0; i < count; i++)
+    {
+      for (j = 0; j < d1_console_leaf_count; j++)
+        if (inputs[i].handle == saved[j].input.handle
+            && inputs[i].ex == saved[j].input.ex
+            && inputs[i].basic == saved[j].input.basic)
+          {
+            d1_console_leaves[i] = saved[j];
+            break;
+          }
+      d1_console_leaves[i].input = inputs[i];
+    }
+  /* A key already cached by getkeystatus is independent of the endpoint
+     lifetime. Keep it until getkey consumes it, including during refresh. */
+  d1_console_leaf_count = count;
+  d1_console_leaf_generation++;
+  if (d1_console_next_leaf >= count) d1_console_next_leaf = 0;
+}
+
+static int
+d1_console_leaf_active (void)
+{
+  return d1_console_direct_poll && (d1_console_leaf_count || d1_console_empty_input_idle)
+         && grub_env_get ("sp8_daily_active");
+}
+
+static void
+d1_console_leaf_timing (unsigned index, grub_uint64_t begin,
+                        grub_efi_status_t status)
+{
+  struct d1_console_leaf_state *leaf = &d1_console_leaves[index];
+  grub_uint64_t elapsed = grub_get_time_ms () - begin;
+  if (leaf->reports < 2 || elapsed > leaf->longest_ms + 20)
+    {
+      char detail[256];
+      grub_snprintf (detail, sizeof (detail),
+                     "EFI_INPUT operation=LeafReadKeyStroke%s source=%u handle=0x%llx elapsed_ms=%llu status=0x%llx",
+                     leaf->input.ex ? "Ex" : "", index,
+                     (unsigned long long) (grub_addr_t) leaf->input.handle,
+                     (unsigned long long) elapsed, (unsigned long long) status);
+      grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+      leaf->reports++;
+      leaf->longest_ms = grub_max (leaf->longest_ms, elapsed);
+    }
+}
+
+/* Bypass ConSplitter's lazy-connect and aggregate wait/read callbacks. Keep
+   one key per device until consumed, and merge modifiers across Ex inputs.
+   A non-owning live query rechecks each handle without a persistent agent
+   OpenList entry, connection, reset, or unsafe protocol pointer cache. */
+static grub_efi_status_t
+d1_console_read_leaf_key (grub_efi_key_data_t *result)
+{
+  grub_efi_key_state_t modifiers;
+  unsigned i, serviced = 0, generation = d1_console_leaf_generation;
+  grub_memset (&modifiers, 0, sizeof (modifiers));
+  if (!d1_console_leaf_count) d1_console_idle_polls++;
+  for (i = 0; i < d1_console_leaf_count; i++)
+    {
+      struct d1_console_leaf_state *leaf = &d1_console_leaves[i];
+      if (!leaf->pending)
+        {
+          void *current;
+          grub_efi_status_t status;
+          grub_efi_key_data_t key;
+          grub_uint64_t begin = grub_get_time_ms ();
+          grub_uint64_t cycle_begin = begin, query_ms, read_ms, sample_ms, service_ms;
+          /* Firmware queues are independent of GPIO's 10ms sample cadence.
+             Poll them at most every5ms rather than millions of times per
+             second; pending keys still deliver immediately and exactly once. */
+          if (leaf->has_polled && begin >= leaf->last_poll_ms && begin - leaf->last_poll_ms < 5)
+            goto merge_modifiers;
+          leaf->has_polled = 1; leaf->last_poll_ms = begin;
+          service_ms = 0;
+          if (!serviced)
+            {
+              serviced = 1;
+              d1_console_service_callbacks ();
+              service_ms = grub_get_time_ms () - begin;
+              if (service_ms > 20) grub_term_poll_input ();
+              /* A callback or sampling hook can withdraw/rebuild inputs.
+                 Never use the previous array slot after that refresh. */
+              if (generation != d1_console_leaf_generation)
+                break;
+            }
+          begin = grub_get_time_ms ();
+          current = grub_efi_console_query_input_protocol (leaf->input.handle, !!leaf->input.ex);
+          query_ms = grub_get_time_ms () - begin;
+          if (grub_get_time_ms () - begin > 20)
+            {
+              char detail[192];
+              grub_snprintf (detail, sizeof (detail),
+                             "EFI_INPUT operation=LeafGetProtocol source=%u elapsed_ms=%llu status=%s",
+                             i, (unsigned long long) (grub_get_time_ms () - begin),
+                             current ? "available" : "unavailable");
+              grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+            }
+          if (current != (void *) (leaf->input.ex ? (void *) leaf->input.ex
+                                                 : (void *) leaf->input.basic))
+            {
+              grub_memset (&leaf->key.key_state, 0, sizeof (leaf->key.key_state));
+              continue;
+            }
+          grub_memset (&key, 0, sizeof (key));
+          begin = grub_get_time_ms ();
+          if (leaf->input.ex)
+            status = leaf->input.ex->read_key_stroke (leaf->input.ex, &key);
+          else
+            status = leaf->input.basic->read_key_stroke (leaf->input.basic, &key.key);
+          read_ms = grub_get_time_ms () - begin;
+          d1_console_leaf_calls++;
+          d1_console_leaf_timing (i, begin, status);
+          if (status == GRUB_EFI_SUCCESS || status == GRUB_EFI_NOT_READY)
+            {
+              leaf->key.key_state = key.key_state;
+              if (status == GRUB_EFI_SUCCESS
+                  && (key.key.scan_code || key.key.unicode_char))
+                {
+                  leaf->key = key;
+                  leaf->pending = 1;
+                }
+            }
+          begin = grub_get_time_ms ();
+          grub_term_poll_input ();
+          sample_ms = grub_get_time_ms () - begin;
+          if (generation != d1_console_leaf_generation)
+            break;
+          unsigned slow_mask = (service_ms > 20 ? 1u : 0u) | (query_ms > 20 ? 2u : 0u)
+                               | (read_ms > 20 ? 4u : 0u) | (sample_ms > 20 ? 8u : 0u);
+          if (leaf->cycle_reports < 2 || grub_get_time_ms () - cycle_begin > leaf->longest_cycle_ms + 20
+              || (slow_mask && slow_mask != leaf->slow_cycle_mask))
+            {
+              char detail[320];
+              grub_uint64_t total = grub_get_time_ms () - cycle_begin;
+              grub_snprintf (detail, sizeof (detail),
+                             "EFI_INPUT_CYCLE source=%u handle=0x%llx service_ms=%llu query_ms=%llu read_ms=%llu sample_hook_ms=%llu total_ms=%llu callbacks_included=1",
+                             i, (unsigned long long) (grub_addr_t) leaf->input.handle,
+                             (unsigned long long) service_ms,
+                             (unsigned long long) query_ms, (unsigned long long) read_ms,
+                             (unsigned long long) sample_ms, (unsigned long long) total);
+              grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+              leaf->cycle_reports++;
+              leaf->longest_cycle_ms = grub_max (leaf->longest_cycle_ms, total);
+            }
+          leaf->slow_cycle_mask = slow_mask;
+        }
+    merge_modifiers:
+      if (leaf->key.key_state.key_shift_state & GRUB_EFI_SHIFT_STATE_VALID)
+        modifiers.key_shift_state |= leaf->key.key_state.key_shift_state;
+      if (leaf->key.key_state.key_toggle_state & GRUB_EFI_TOGGLE_STATE_VALID)
+        modifiers.key_toggle_state |= leaf->key.key_state.key_toggle_state;
+    }
+  for (i = 0; i < d1_console_leaf_count; i++)
+    {
+      unsigned index = (d1_console_next_leaf + i) % d1_console_leaf_count;
+      struct d1_console_leaf_state *leaf = &d1_console_leaves[index];
+      if (leaf->pending)
+        {
+          *result = leaf->key;
+          d1_console_cached_input_handle = leaf->input.handle;
+          d1_console_cached_leaf_input = 1;
+          result->key_state = modifiers;
+          leaf->pending = 0;
+          d1_console_next_leaf = (index + 1) % d1_console_leaf_count;
+          return GRUB_EFI_SUCCESS;
+        }
+    }
+  grub_memset (result, 0, sizeof (*result));
+  result->key_state = modifiers;
+  return GRUB_EFI_NOT_READY;
+}
+
 static void
 d1_console_timing (const char *operation, grub_uint64_t begin, grub_efi_status_t status)
 {
   grub_uint64_t elapsed = grub_get_time_ms () - begin;
-  if (d1_console_reports < 2 || elapsed > d1_console_longest_ms + 20)
+  unsigned index = !grub_strcmp (operation, "CheckEvent") ? 0
+                   : !grub_strcmp (operation, "ReadKeyStroke") ? 1 : 2;
+  d1_console_calls[index]++;
+  if (d1_console_reports[index] < 2 || elapsed > d1_console_longest_ms[index] + 20)
     {
       char detail[192];
       grub_snprintf (detail, sizeof (detail), "EFI_INPUT operation=%s elapsed_ms=%llu status=0x%llx",
                      operation, (unsigned long long) elapsed, (unsigned long long) status);
       grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
-      d1_console_reports++;
-      d1_console_longest_ms = grub_max (d1_console_longest_ms, elapsed);
+      d1_console_reports[index]++;
+      d1_console_longest_ms[index] = grub_max (d1_console_longest_ms[index], elapsed);
     }
 }
 
-/* UEFI nonblocking input. In the D1 menu avoid calling an empty firmware
-   input queue: mu's OSK can display its icon as a side effect of that read. */
+/* Both UEFI input protocols support direct polling (EFI_NOT_READY on an
+   empty queue). This Surface's aggregate CheckEvent and first aggregate
+   read have both blocked earlier revisions. With the OSK protocol verified,
+   skip the event gate and prefer validated live endpoints, keeping all OSK
+   modes intact. Compatibility aggregate reads and their real latency remain
+   available; an unverified OSK keeps the previous event gate. */
 static int
 d1_console_ready (grub_efi_event_t event)
 {
   grub_efi_status_t status;
   grub_uint64_t begin;
+  if (grub_env_get ("sp8_daily_active") && d1_console_direct_poll)
+    return 1;
   if (!grub_env_get ("sp8_daily_active") || !event) return 1;
   begin = grub_get_time_ms ();
   status = grub_efi_system_table->boot_services->check_event (event);
@@ -274,6 +677,24 @@ grub_efi_translate_key (grub_efi_input_key_t key)
   return GRUB_TERM_NO_KEY;
 }
 
+/* Log consumed navigation keys only. Printable command/password characters
+   never enter this log; provenance distinguishes EFI/OSK from GPIO delivery. */
+static void
+d1_console_record_navigation (int key, grub_efi_handle_t handle, unsigned leaf)
+{
+  const char *name = key == GRUB_TERM_KEY_UP ? "UP" : key == GRUB_TERM_KEY_DOWN ? "DOWN"
+                     : key == GRUB_TERM_KEY_LEFT ? "LEFT" : key == GRUB_TERM_KEY_RIGHT ? "RIGHT"
+                     : key == GRUB_TERM_ESC ? "BACK" : key == '\r' || key == '\n' ? "ENTER" : NULL;
+  char detail[160];
+  if (!name || !grub_env_get ("sp8_daily_active")) return;
+  d1_console_navigation_keys++;
+  if (d1_console_navigation_keys > 12) return;
+  grub_snprintf (detail, sizeof (detail), "EFI_NAV_DELIVER key=%s route=%s handle=0x%llx count=%llu",
+                 name, leaf ? "leaf" : "aggregate", (unsigned long long) (grub_addr_t) handle,
+                 (unsigned long long) d1_console_navigation_keys);
+  grub_command_execute ("sp8_gpio", 2, (char *[]) {(char *) "log", detail});
+}
+
 static int
 grub_console_getkey_con (struct grub_term_input *term __attribute__ ((unused)))
 {
@@ -290,7 +711,9 @@ grub_console_getkey_con (struct grub_term_input *term __attribute__ ((unused)))
   if (status != GRUB_EFI_SUCCESS)
     return GRUB_TERM_NO_KEY;
 
-  return grub_efi_translate_key(key);
+  int translated = grub_efi_translate_key (key);
+  d1_console_record_navigation (translated, grub_efi_system_table->console_in_handler, 0);
+  return translated;
 }
 
 /*
@@ -304,31 +727,39 @@ grub_console_read_key_stroke (
                    grub_efi_key_data_t *key_data_ret, int *key_ret,
                    int consume)
 {
-  static grub_efi_key_data_t key_data;
+  grub_efi_key_data_t *key_data = &d1_console_key_data;
   grub_efi_status_t status;
   int key;
 
-  if (!text_input)
+  if (!text_input && !d1_console_leaf_active ())
     return GRUB_ERR_EOF;
 
-  key = grub_efi_translate_key (key_data.key);
+  key = grub_efi_translate_key (key_data->key);
   if (key == GRUB_TERM_NO_KEY) {
-    if (!d1_console_ready (text_input->wait_for_key)) return GRUB_ERR_EOF;
-    grub_uint64_t begin = grub_get_time_ms ();
-    status = text_input->read_key_stroke (text_input, &key_data);
-    if (grub_env_get ("sp8_daily_active")) d1_console_timing ("ReadKeyStrokeEx", begin, status);
+    if (d1_console_leaf_active ())
+      status = d1_console_read_leaf_key (key_data);
+    else
+      {
+        grub_uint64_t begin;
+        if (!d1_console_ready (text_input->wait_for_key)) return GRUB_ERR_EOF;
+        begin = grub_get_time_ms ();
+        status = text_input->read_key_stroke (text_input, key_data);
+        d1_console_cached_input_handle = grub_efi_system_table->console_in_handler;
+        d1_console_cached_leaf_input = 0;
+        if (grub_env_get ("sp8_daily_active")) d1_console_timing ("ReadKeyStrokeEx", begin, status);
+      }
     if (status != GRUB_EFI_SUCCESS)
       return GRUB_ERR_EOF;
 
-    key = grub_efi_translate_key (key_data.key);
+    key = grub_efi_translate_key (key_data->key);
   }
 
-  *key_data_ret = key_data;
+  *key_data_ret = *key_data;
   *key_ret = key;
 
   if (consume) {
-    key_data.key.scan_code = 0;
-    key_data.key.unicode_char = 0;
+    key_data->key.scan_code = 0;
+    key_data->key.unicode_char = 0;
   }
 
   return GRUB_ERR_NONE;
@@ -360,6 +791,7 @@ grub_console_getkey_ex (struct grub_term_input *term)
 	key |= GRUB_TERM_CTRL;
     }
 
+  d1_console_record_navigation (key, d1_console_cached_input_handle, d1_console_cached_leaf_input);
   return key;
 }
 
@@ -423,7 +855,7 @@ grub_console_getkey (struct grub_term_input *term)
   if (grub_efi_is_finished)
     return 0;
 
-  if (term->data)
+  if (term->data || d1_console_leaf_active ())
     return grub_console_getkey_ex(term);
   else
     return grub_console_getkey_con(term);

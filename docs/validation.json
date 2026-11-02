@@ -3,9 +3,9 @@
   "device": "Surface Pro 8",
   "desktop": "GNOME Wayland",
   "linux_power_source_sha256": "9e492d640363253608e7a789f3c3a82a13ece269934e791ed27ab15c65f9dd49",
-  "accepted_grub_image_sha256": "3ece1899e09b6926ad9dfd86ed3421b2b27e526eb42fa147b8637f0c83058f5c",
-  "user_report": "Volume selection and power confirmation work; other acceptance passed; brief startup stutter remains.",
-  "publication": "Source snapshot of accepted 2026-10-30 GRUB, not the subsequent in-progress latency fix.",
+  "accepted_grub_image_sha256": "a8441f53a3b415009622b695566433cdaa3eb5a5da456e79d35041c5fdb81445",
+  "user_report": "Power, volume, keyboard Enter and Esc all tested; no perceived hitch in this run.",
+  "publication": "2026-11-02 a844 D1 source; original firmware OSK retained. Public rebuild is a new artifact, not the signed Surface image.",
   "power_evidence": {
     "physical_short_press_display_off_mode": 3,
     "network_connected_and_ssh_alive": true,
@@ -14,7 +14,38 @@
     "maintenance_signal_check_separate_from_physical": true
   },
   "source_archive_sha256": "f3c97391f7c4eaa677a78e090c7e97e6dc47b16f655f04683ebd37bef7fe0faa",
-  "public_offline_validation": {
+  "historical_grub_image_sha256": "3ece1899e09b6926ad9dfd86ed3421b2b27e526eb42fa147b8637f0c83058f5c",
+  "GRUB_current_hardware": {
+    "BUILD": "grub-daily-D1-dispatch-trace-20261102-final01",
+    "log": "GM0018.LOG",
+    "log_sha256": "24168111a5b35ea142c67292d07294a200ae4f410bd0dde58a2ba4ebd408fed5",
+    "display": [
+      2880,
+      1920
+    ],
+    "entry_to_firstframe_ms": 614,
+    "entry_to_firstpostEFI_GPIOsample_ms": 637,
+    "frame_to_sample_ms": 23,
+    "first_EFI_leaf_read_ms": 4,
+    "aggregate_reads": 0,
+    "fallback_entries": 0,
+    "physical_volume_up_actions": 8,
+    "physical_volume_down_actions": 9,
+    "physical_power_Enter_actions": 2,
+    "double_volume_back_actions": 1,
+    "original_firmware_OSK_Enter_actions": 1,
+    "original_firmware_OSK_Esc_actions": 1,
+    "external_physical_keyboard_Enter_Esc_separately_accepted": false,
+    "Ubuntu_script_errors": 0,
+    "Ubuntu_loader_loaded": 1,
+    "complete_END": true,
+    "user_no_perceived_hitch_this_run": true,
+    "max_logged_sample_gap_ms": 1063,
+    "cooperative_sample_interval_ms": 1048,
+    "all_cold_warm_Windows_boot_paths_certified": false,
+    "zero_internal_wait_claimed": false
+  },
+  "public_offline_validation_before_current_sync": {
     "python_and_publication_tests": 7,
     "ubuntu_patch_application_passed": true,
     "full_x86_64_configure_and_make_passed": true,
@@ -24,5 +55,15 @@
     "EFI_console_and_GOP_host_fixtures_passed": true,
     "signing_of_public_build_performed": false,
     "public_build_booted_on_hardware": false
+  },
+  "current_public_sync_checks": {
+    "python_install_restore_and_publication_checks": 7,
+    "pinned_Ubuntu_and_current_Surface_patch_application_passed": true,
+    "current_public_source_matches_original_a844_runtime": true,
+    "ASan_UBSan_dispatch_writer_console_GOP_lifecycle_passed": true,
+    "new_fresh_public_make_or_unsigned_image_run_this_sync": false,
+    "original_a844_signed_build_and_isolated_boot_verified_previously": true,
+    "public_rebuild_hardware_acceptance_claimed": false,
+    "warnings_preserved": "Existing GOP callback type warnings remain in host fixture; no new runtime error or claimed zero-warning build."
   }
 }

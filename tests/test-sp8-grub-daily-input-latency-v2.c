@@ -22,7 +22,20 @@ int grub_efi_is_finished;
 grub_err_t grub_errno;
 char grub_errmsg[GRUB_MAX_ERRMSG];
 void (*grub_sp8_error_hook)(grub_err_t,const char*);
+void grub_efi_console_set_direct_poll(int enabled) {(void)enabled;}
+void grub_efi_console_set_leaf_inputs(unsigned count,const struct grub_efi_console_leaf *inputs) {(void)count;(void)inputs;}
+void grub_efi_console_set_empty_input_policy(int enabled) {(void)enabled;}
+void grub_efi_console_log_input_summary(void) { }
+void grub_efi_console_configure_swm(struct grub_efi_swm *p,const struct grub_efi_swm *copy) {(void)p;(void)copy;}
+void grub_efi_console_release_swm(void) { }
+void *grub_efi_open_protocol(grub_efi_handle_t handle,grub_guid_t *guid,grub_efi_uint32_t attributes) {(void)handle;(void)guid;(void)attributes;return NULL;}
+void *grub_efi_console_query_input_protocol(grub_efi_handle_t handle,int extended) {(void)handle;(void)extended;return NULL;}
+grub_efi_device_path_t *grub_efi_get_device_path(grub_efi_handle_t handle) {(void)handle;return NULL;}
 void (*grub_term_poll_input_hook)(void);
+grub_term_input_trace_t grub_term_input_trace_hook;
+void (*grub_term_poll_usb)(int);
+void (*grub_net_poll_cards_idle)(void);
+struct grub_term_input *grub_term_inputs;
 void grub_term_poll_input(void) {
   grub_err_t saved=grub_errno;char message[GRUB_MAX_ERRMSG];
   memcpy(message,grub_errmsg,sizeof(message));
@@ -50,6 +63,7 @@ void *grub_memmove(void *a,const void *b,grub_size_t n) { return memmove(a,b,n);
 void *grub_memset(void *a,int c,grub_size_t n) { return memset(a,c,n); }
 int grub_memcmp(const void *a,const void *b,grub_size_t n) { return memcmp(a,b,n); }
 int grub_strcmp(const char *a,const char *b) { return strcmp(a,b); }
+int grub_strncmp(const char *a,const char *b,grub_size_t n) { return strncmp(a,b,n); }
 char *grub_strcpy(char *a,const char *b) { return strcpy(a,b); }
 const char *grub_env_get(const char *name) { (void)name;return "test-selected-os"; }
 void grub_error_push(void) { saved_error=grub_errno;grub_errno=0; }
@@ -142,6 +156,8 @@ static void setup(void) {
   io[0][0]=io[1][0]=0x00960000;io[0][3]=io[1][3]=0x700;
   io[0][0x730/4]=0x44000102;io[1][0x860/4]=io[1][0x870/4]=0x84000102;
   m1_enabled=0;m1_log_file=NULL;fake_tick=raw_reads=map_reads=gcd_mode=map_mode=held_initial=change_config=0;
+  m1_log_pending_bytes=m1_log_busy=m1_log_metadata_lines=m1_log_force_after_io=m1_log_drain_depth=0;
+  m1_log_inflight_bytes=0;
   log_used=0;memset(log_data,0,sizeof(log_data));
 }
 static void attach_log(void) { m1_log_file=&memory_log;m1_log_bytes=0;strcpy(m1_log_name,"GM0001.LOG"); }

@@ -3,6 +3,7 @@
  * Never acknowledges interrupts, changes ownership or writes GPIO registers.
  */
 #include <grub/dl.h>
+#include <grub/kernel.h>
 #include <grub/term.h>
 #include <grub/misc.h>
 #include <grub/mm.h>
@@ -49,10 +50,74 @@ static grub_uint64_t d1_max_sample_gap_ms;
 static unsigned d1_sample_gap_count;
 static unsigned m1_sampled;
 static unsigned d1_first_poll_recorded;
+static unsigned d1_first_EFI_return_seen, d1_first_post_EFI_sample_recorded;
 static const char * const m1_names[3] = {"power", "volume_up", "volume_down"};
 static unsigned d1_error_busy;
+static unsigned d1_dispatch_slow_count[4], d1_dispatch_reports[4];
+static grub_uint64_t d1_dispatch_max_ms[4];
+static const char * const d1_dispatch_phases[4] = {"sample", "usb", "net", "terminal"};
 static grub_guid_t m1_acpi_guid = GRUB_EFI_ACPI_20_TABLE_GUID;
 static grub_guid_t m1_dxe_guid = {0x05ad34ba,0x6f02,0x4214,{0x95,0x2e,0x4d,0xa0,0x39,0x8e,0x2b,0xb9}};
+
+static void
+d1_trace_input_component (const char *phase, const char *name,
+                          grub_uint64_t begin, grub_uint64_t end, int key)
+{
+  unsigned i;
+  grub_uint64_t elapsed;
+  if (!m1_log_file || grub_efi_is_finished || end < begin) return;
+  elapsed = end - begin;
+  if (elapsed <= 20) return;
+  for (i = 0; i < ARRAY_SIZE (d1_dispatch_phases); i++)
+    if (!grub_strcmp (phase, d1_dispatch_phases[i])) break;
+  if (i == ARRAY_SIZE (d1_dispatch_phases)) return;
+  d1_dispatch_slow_count[i]++;
+  if (d1_dispatch_reports[i] < 8 || elapsed > d1_dispatch_max_ms[i] + 20)
+    {
+      m1_record ("D1 INPUT_COMPONENT phase=%s name=%.47s begin_ms=%llu end_ms=%llu total_ms=%llu key_class=%s diagnostic_io_after_interval=1\n",
+                 phase, name, (unsigned long long) begin, (unsigned long long) end,
+                 (unsigned long long) elapsed, key == GRUB_TERM_NO_KEY ? "none" : "accepted");
+      d1_dispatch_reports[i]++;
+    }
+  d1_dispatch_max_ms[i] = grub_max (d1_dispatch_max_ms[i], elapsed);
+}
+
+static void
+d1_start_input_trace (void)
+{
+  grub_term_input_t term;
+  unsigned count = 0;
+  if (!m1_log_file || grub_efi_is_finished) return;
+  if (grub_term_input_trace_hook != d1_trace_input_component)
+    {
+      grub_memset (d1_dispatch_slow_count, 0, sizeof (d1_dispatch_slow_count));
+      grub_memset (d1_dispatch_reports, 0, sizeof (d1_dispatch_reports));
+      grub_memset (d1_dispatch_max_ms, 0, sizeof (d1_dispatch_max_ms));
+      grub_term_input_trace_hook = d1_trace_input_component;
+    }
+  m1_record ("D1 INPUT_HOOKS sample=%u native_usb=%u net_idle=%u observer_after_operations=1 input_order_unchanged=1\n",
+             !!grub_term_poll_input_hook, !!grub_term_poll_usb, !!grub_net_poll_cards_idle);
+  FOR_ACTIVE_TERM_INPUTS (term)
+    {
+      if (count < 16)
+        m1_record ("D1 INPUT_TERMINAL index=%u name=%.47s\n", count, term->name ? term->name : "unnamed");
+      count++;
+    }
+  m1_record ("D1 INPUT_TERMINAL_COUNT count=%u names_truncated=%u threshold_ms=20 per_phase_initial_reports=8\n",
+             count, count > 16);
+}
+
+static void
+d1_stop_input_trace (void)
+{
+  unsigned i;
+  if (grub_term_input_trace_hook != d1_trace_input_component) return;
+  grub_term_input_trace_hook = NULL;
+  for (i = 0; i < ARRAY_SIZE (d1_dispatch_phases); i++)
+    m1_record ("D1 INPUT_COMPONENT_SUMMARY phase=%s slow_calls=%u max_ms=%llu reports=%u includes_original_operation_callbacks=1\n",
+               d1_dispatch_phases[i], d1_dispatch_slow_count[i],
+               (unsigned long long) d1_dispatch_max_ms[i], d1_dispatch_reports[i]);
+}
 
 #ifndef M1_LOAD32
 #define M1_LOAD32(address) (*(volatile uint32_t *) (grub_addr_t) (address))
@@ -236,6 +301,7 @@ static void m1_sample_nonblocking (void);
 static void
 m1_stop (const char *reason)
 {
+  d1_stop_input_trace ();
   d1_restore_osk ();
   if (grub_term_poll_input_hook == m1_sample_nonblocking)
     grub_term_poll_input_hook = NULL;
@@ -266,6 +332,8 @@ m1_sample_nonblocking (void)
   unsigned pressed[3], i;
   int event[3];
   grub_uint64_t now_ms;
+  grub_uint64_t maintenance_ms = 0, map_ms = 0, route_ms = 0, gap_ms = 0;
+  grub_uint64_t previous_log_io_ms = 0, previous_log_io_end_ms = 0;
   if (!m1_enabled || grub_efi_is_finished) return;
   now_ms = grub_get_time_ms ();
   if (!d1_first_poll_recorded) {
@@ -277,24 +345,35 @@ m1_sample_nonblocking (void)
     m1_stop ("clock_out_of_range"); return;
   }
   if (!m1_sampled || now_ms - m1_last_sample_ms >= 10) {
-    /* While a menu action displays its result, GRUB may not poll input.
-     * Do not turn an unobserved long gap into a freshly confirmed press. */
+    if (now_ms - m1_last_map_ms >= 1000) {
+      grub_uint64_t maintenance_begin = grub_get_time_ms (), map_done, input_done;
+      if (!m1_refresh_map ()) { m1_stop ("memory_map_unavailable"); return; }
+      map_done = grub_get_time_ms ();
+      d1_refresh_console_leaves ();
+      input_done = grub_get_time_ms ();
+      m1_last_map_ms = input_done;
+      map_ms = map_done - maintenance_begin;
+      route_ms = input_done - map_done;
+      maintenance_ms = input_done - maintenance_begin;
+      /* Refresh can dispatch firmware callbacks. Timestamp actual sampling
+         afterwards, rather than report the time taken before that call. */
+      now_ms = grub_get_time_ms ();
+    }
+    if (!m1_enabled || grub_efi_is_finished) return;
+    if (now_ms < m1_last_sample_ms || now_ms - m1_start_ms > 0xffffffffULL * 10)
+      { m1_stop ("clock_out_of_range"); return; }
+    /* Check the real sample gap after maintenance. Its EFI callbacks may
+       have blocked despite an apparently short gap at function entry. */
     if (m1_sampled && now_ms - m1_last_sample_ms > 100) {
+      gap_ms = now_ms - m1_last_sample_ms;
+      previous_log_io_ms = m1_log_last_io_ms;
+      previous_log_io_end_ms = m1_log_last_io_end_ms;
       d1_sample_gap_count++;
-      d1_max_sample_gap_ms = grub_max (d1_max_sample_gap_ms, now_ms - m1_last_sample_ms);
-      m1_record ("D1 INPUT SAMPLE_GAP gap_ms=%llu confirmed_keys_retained=%u time_ms=%llu\n",
-                 (unsigned long long) (now_ms - m1_last_sample_ms), m1_actions.count,
-                 (unsigned long long) now_ms);
+      d1_max_sample_gap_ms = grub_max (d1_max_sample_gap_ms, gap_ms);
       grub_memset (m1_actions.debounce, 0, sizeof (m1_actions.debounce));
       m1_actions.power_pending = 0;
-      /* Already debounced keys remain queued. Only unobserved pending
-       * transitions are invalidated by a gap in cooperative sampling. */
       m1_actions.return_chord_active = 0;
       m1_actions.return_chord_sent = 1;
-    }
-    if (now_ms - m1_last_map_ms >= 1000) {
-      if (!m1_refresh_map ()) { m1_stop ("memory_map_unavailable"); return; }
-      m1_last_map_ms = now_ms;
     }
     tick = (uint32_t) ((now_ms - m1_start_ms) / 10);
     m1_sampled = 1; m1_last_sample_ms = now_ms;
@@ -308,10 +387,26 @@ m1_sample_nonblocking (void)
     if (!m1_actions_update (&m1_actions, tick, pressed, event)) {
       m1_stop ("input_queue_full"); return;
     }
+    /* Log after capturing the pins so file I/O is not included in their
+       timestamp and cannot create a false newly debounced transition. */
+    if (maintenance_ms > 20)
+      m1_record ("D1 INPUT MAINTENANCE memory_map_ms=%llu route_ms=%llu total_ms=%llu time_ms=%llu\n",
+                 (unsigned long long) map_ms, (unsigned long long) route_ms,
+                 (unsigned long long) maintenance_ms, (unsigned long long) now_ms);
+    if (gap_ms)
+      m1_record ("D1 INPUT SAMPLE_GAP gap_ms=%llu confirmed_keys_retained=%u time_ms=%llu last_log_io_ms=%llu last_log_io_end_ms=%llu\n",
+                 (unsigned long long) gap_ms, m1_actions.count, (unsigned long long) now_ms,
+                 (unsigned long long) previous_log_io_ms, (unsigned long long) previous_log_io_end_ms);
     for (i = 0; i < 3; i++) if (event[i])
       m1_record ("GPIO EVENT button=%s state=%s sample_tick=%u raw=0x%08x\n", m1_names[i],
                  event[i] > 0 ? "pressed" : "released", tick, raw[i]);
+    if (d1_first_EFI_return_seen && !d1_first_post_EFI_sample_recorded) {
+      d1_first_post_EFI_sample_recorded = 1;
+      m1_record ("D1 PERF FIRST_SAMPLE_AFTER_EFI_RETURN sample_tick=%u time_ms=%llu\n",
+                 tick, (unsigned long long) now_ms);
+    }
   }
+  m1_log_poll ();
 }
 
 static int
@@ -341,6 +436,7 @@ m1_enable (void)
   grub_memset (&m1_actions, 0, sizeof (m1_actions));
   m1_gcd = NULL; m1_sampled = 0;
   d1_first_poll_recorded = 0;
+  d1_first_EFI_return_seen = d1_first_post_EFI_sample_recorded = 0;
   d1_sample_gap_count = 0; d1_max_sample_gap_ms = 0;
   m1_ram_reads = m1_mmio_reads = m1_refused = d1_gcd_queries = 0;
   m1_log_start ();
@@ -391,6 +487,12 @@ m1_enable (void)
 static grub_err_t
 m1_command (grub_command_t command __attribute__ ((unused)), int argc, char **argv)
 {
+  if (argc == 1 && !grub_strcmp (argv[0], "prepare-entry")) {
+    m1_record ("D1 ENTRY_UI_PREPARE before_GRUB_clear=1 GPIO_ready=%u OSK_scope=%u time_ms=%llu\n",
+               m1_enabled, d1_osk_scope_active, (unsigned long long) grub_get_time_ms ());
+    d1_prepare_entry_ui (); return GRUB_ERR_NONE;
+  }
+  if (argc == 1 && !grub_strcmp (argv[0], "resume-entry")) { d1_resume_entry_ui (); return GRUB_ERR_NONE; }
   if (argc == 1 && !grub_strcmp (argv[0], "on")) return m1_enable ();
   if (argc == 1 && !grub_strcmp (argv[0], "off")) {
     m1_stop ("user_off"); m1_log_finish ("user_off"); return GRUB_ERR_NONE;
@@ -400,11 +502,19 @@ m1_command (grub_command_t command __attribute__ ((unused)), int argc, char **ar
     m1_log_start ();
     m1_record ("D1 BOOT entry=daily signed_embedded_version=D1 time_ms=%llu\n",
                (unsigned long long) grub_get_time_ms ());
+    d1_record_firmware_boot_context ();
     return GRUB_ERR_NONE;
   }
   if (argc == 2 && !grub_strcmp (argv[0], "log")) {
+    if (!d1_first_EFI_return_seen && grub_strlen (argv[1]) >= 20
+        && !grub_memcmp (argv[1], "EFI_INPUT operation=", 20)) d1_first_EFI_return_seen = 1;
     m1_record ("D1 PHASE %s time_ms=%llu\n", argv[1],
                (unsigned long long) grub_get_time_ms ());
+    if (grub_strlen (argv[1]) >= 16 && !grub_memcmp (argv[1], "MENU_INPUT_READY", 16))
+      {
+        d1_record_osk_geometry ("menu_input_ready");
+        d1_start_input_trace ();
+      }
     return GRUB_ERR_NONE;
   }
   if (argc == 2 && !grub_strcmp (argv[0], "log-end")) {
@@ -492,6 +602,7 @@ GRUB_MOD_INIT (sp8_gpio)
 }
 GRUB_MOD_FINI (sp8_gpio)
 {
+  d1_stop_input_trace ();
   if (grub_term_poll_input_hook == m1_sample_nonblocking)
     grub_term_poll_input_hook = NULL;
   if (grub_sp8_error_hook == d1_log_error) grub_sp8_error_hook = NULL;

@@ -11,10 +11,10 @@ This is an independently maintained companion to [linux-surface](https://github.
 | Module | Tested on Surface Pro 8 | Limits |
 | :-- | :-- | :-- |
 | Linux power button | Lock before blanking, wake to the lock screen, network and SSH remain available | GNOME Wayland, dedicated MSHW0040 power device, Intel backlight |
-| GRUB buttons | Volume selection and power confirmation accepted by the owner | A brief startup stall remains |
+| GRUB buttons and original firmware OSK | Volume, power, back, original OSK Enter/Esc passed; no perceived hitch in the latest run | Logged sampling/redraw intervals remain; other boot paths are not universally certified |
 | GTK toolbox | Dark GUI, version checks, enable/disable, rollback, logs | Local EFI build/signing required on another device |
 
-The published GRUB baseline is the accepted **2026-10-30 D1** source snapshot. Subsequent latency work is being validated separately. A locally rebuilt image is a new artifact and requires its own hardware acceptance.
+The published GRUB source now matches the **2026-11-02 a844 D1** revision. GM18 binds that original Surface Pro 8 image and verifies physical buttons, original firmware OSK Enter/Esc, normal Ubuntu handoff and the owner’s no-perceived-hitch report. A locally rebuilt image is a new artifact and requires its own hardware acceptance.
 
 ## Features
 
@@ -135,7 +135,7 @@ See [the GRUB module guide](../../grub-buttons/README.md) for detailed installat
 
 ## Known issues and validation boundaries
 
-- The accepted GRUB baseline still has a visible startup stall. Firmware input, GOP and initialization timing must be compared using actual boot logs before claiming a fix.
+- The owner reported no perceived hitch in the latest accepted run. D1 entry to first frame was 614ms and to resumed sampling 637ms; a later 1.06s sampling interval and slower redraws with the original OSK visible remain in the log. This is not a guarantee of zero waiting on every cold or Windows-to-GRUB restart.
 - Other devices and desktops have not been validated. The power service and GRUB GPIO contract are hardware-specific.
 - Historical physical Linux tests used `7.2.12-1-surface`; the device later updated to `7.2.13-1-surface`. Old results are not relabeled as independent new-kernel tests.
 - Maintenance-signal tests and hardware power-button tests are recorded separately.

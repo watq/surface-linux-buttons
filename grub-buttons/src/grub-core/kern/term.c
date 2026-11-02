@@ -35,6 +35,31 @@ grub_uint8_t grub_term_highlight_color = GRUB_TERM_DEFAULT_HIGHLIGHT_COLOR;
 void (*grub_term_poll_usb) (int wait_for_completion) = NULL;
 void (*grub_net_poll_cards_idle) (void) = NULL;
 void (*grub_term_poll_input_hook) (void) = NULL;
+grub_term_input_trace_t grub_term_input_trace_hook = NULL;
+
+static void
+grub_term_trace_completed (grub_term_input_trace_t trace, const char *phase,
+                           const char *name, grub_uint64_t begin, int key)
+{
+  static int busy;
+  grub_uint64_t end;
+  grub_err_t saved;
+  char message[GRUB_MAX_ERRMSG];
+  if (!trace || trace != grub_term_input_trace_hook || busy)
+    return;
+  end = grub_get_time_ms ();
+  if (end < begin || end - begin <= 20)
+    return;
+  /* The measured operation has already returned. Isolate diagnostic I/O
+     and preserve the caller's error, including during firmware callbacks. */
+  busy = 1;
+  saved = grub_errno;
+  grub_memcpy (message, grub_errmsg, sizeof (message));
+  trace (phase, name, begin, end, key);
+  grub_errno = saved;
+  grub_memcpy (grub_errmsg, message, sizeof (message));
+  busy = 0;
+}
 
 void
 grub_term_poll_input (void)
@@ -106,18 +131,40 @@ int
 grub_getkey_noblock (void)
 {
   grub_term_input_t term;
+  grub_term_input_trace_t trace = grub_term_input_trace_hook;
+  grub_uint64_t begin = trace ? grub_get_time_ms () : 0;
 
   grub_term_poll_input ();
+  grub_term_trace_completed (trace, "sample", "cooperative", begin, GRUB_TERM_NO_KEY);
 
   if (grub_term_poll_usb)
-    grub_term_poll_usb (0);
+    {
+      begin = trace ? grub_get_time_ms () : 0;
+      grub_term_poll_usb (0);
+      grub_term_trace_completed (trace, "usb", "native_usb", begin, GRUB_TERM_NO_KEY);
+    }
 
   if (grub_net_poll_cards_idle)
-    grub_net_poll_cards_idle ();
+    {
+      begin = trace ? grub_get_time_ms () : 0;
+      grub_net_poll_cards_idle ();
+      grub_term_trace_completed (trace, "net", "idle_cards", begin, GRUB_TERM_NO_KEY);
+    }
 
   FOR_ACTIVE_TERM_INPUTS(term)
   {
+    char name[48];
+    if (trace)
+      {
+        const char *source = term->name ? term->name : "unnamed";
+        unsigned i = 0;
+        while (i + 1 < sizeof (name) && source[i])
+          { name[i] = source[i]; i++; }
+        name[i] = 0;
+      }
+    begin = trace ? grub_get_time_ms () : 0;
     int key = term->getkey (term);
+    grub_term_trace_completed (trace, "terminal", trace ? name : "", begin, key);
     if (key != GRUB_TERM_NO_KEY)
       return key;
   }

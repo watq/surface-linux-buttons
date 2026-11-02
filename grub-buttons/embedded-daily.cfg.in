@@ -8,7 +8,7 @@ export sp8_daily_skip
 terminal_input console
 terminal_output console
 sp8_gpio log-start
-sp8_gpio log BUILD=surface-buttons-public-d1
+sp8_gpio log BUILD=surface-buttons-public-d1-20261102
 sp8_gpio log DAILY_ENTRY
 if sp8_gpio on; then
   terminal_input --append sp8_gpio

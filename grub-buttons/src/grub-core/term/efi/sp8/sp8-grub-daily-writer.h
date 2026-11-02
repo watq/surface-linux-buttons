@@ -35,6 +35,21 @@ static M1_FILE *m1_log_file;
 static unsigned m1_log_bytes;
 static char m1_log_name[16];
 static unsigned m1_log_attempted;
+/* Routine metadata can share one EFI Write/Flush. Critical input/errors and
+   handoff checkpoints drain immediately. No accepted key or fault text is
+   dropped to gain speed; a sudden loss of power can lose only metadata since
+   the last checkpoint (idle servicing tries every100ms). */
+#define D1_LOG_BUFFER_SIZE 4096u
+static char m1_log_pending[D1_LOG_BUFFER_SIZE], m1_log_writing[D1_LOG_BUFFER_SIZE];
+static unsigned m1_log_pending_bytes, m1_log_busy, m1_log_metadata_lines;
+static grub_uint64_t m1_log_pending_since_ms;
+static grub_uint64_t m1_log_io_ms, m1_log_write_calls, m1_log_flush_calls;
+static grub_uint64_t m1_log_max_write_ms, m1_log_max_flush_ms;
+static grub_uint64_t m1_log_last_io_ms, m1_log_last_io_end_ms;
+static unsigned m1_log_reentrant_overflow;
+static unsigned m1_log_force_after_io;
+static unsigned m1_log_drain_depth;
+static unsigned m1_log_inflight_bytes;
 #ifndef SP8_LOG_VERSION
 #define SP8_LOG_VERSION "M1"
 #endif
@@ -53,23 +68,120 @@ m1_utf16 (grub_efi_char16_t *output, const char *input, grub_size_t count)
 static void
 m1_log_abandon (void)
 {
-  if (m1_log_file) m1_log_file->close (m1_log_file);
+  M1_FILE *file = m1_log_file;
   m1_log_file = NULL;
+  m1_log_pending_bytes = m1_log_inflight_bytes = 0;
+  if (file) file->close (file);
+}
+
+static void
+m1_log_flush_pending (void)
+{
+  grub_efi_uintn_t size, offset = 0, length;
+  grub_uint64_t begin, duration, io_begin;
+  if (!m1_log_file || !m1_log_pending_bytes || m1_log_busy || grub_efi_is_finished) return;
+  m1_log_busy = 1;
+  m1_log_force_after_io = 0;
+  length = m1_log_pending_bytes;
+  m1_log_inflight_bytes = length;
+  grub_memcpy (m1_log_writing, m1_log_pending, length);
+  m1_log_pending_bytes = 0;
+  io_begin = grub_get_time_ms ();
+  while (offset < length) {
+    size = length - offset;
+    begin = grub_get_time_ms ();
+    grub_efi_status_t status = m1_log_file->write (m1_log_file, &size, m1_log_writing + offset);
+    duration = grub_get_time_ms () - begin;
+    m1_log_io_ms += duration; m1_log_write_calls++;
+    m1_log_max_write_ms = grub_max (m1_log_max_write_ms, duration);
+    if (status != GRUB_EFI_SUCCESS || !size || size > length - offset)
+      { m1_log_abandon (); m1_log_busy = m1_log_inflight_bytes = 0; return; }
+    offset += size; m1_log_bytes += size;
+    m1_log_inflight_bytes = length - offset;
+  }
+  begin = grub_get_time_ms ();
+  grub_efi_status_t status = m1_log_file->flush (m1_log_file);
+  duration = grub_get_time_ms () - begin;
+  m1_log_io_ms += duration; m1_log_flush_calls++;
+  m1_log_max_flush_ms = grub_max (m1_log_max_flush_ms, duration);
+  m1_log_last_io_end_ms = grub_get_time_ms ();
+  m1_log_last_io_ms = m1_log_last_io_end_ms - io_begin;
+  if (status != GRUB_EFI_SUCCESS) m1_log_abandon ();
+  m1_log_busy = 0;
+  if (m1_log_force_after_io && m1_log_file && m1_log_pending_bytes && !m1_log_drain_depth)
+    {
+      m1_log_force_after_io = 0;
+      /* A critical line queued by an EFI callback during Write/Flush must
+         be persisted as soon as that I/O returns. No GRUB callback reads
+         or consumes the raw input event queue here. */
+      m1_log_drain_depth = 1;
+      m1_log_flush_pending ();
+      m1_log_drain_depth = 0;
+    }
+}
+
+static int
+m1_log_is_checkpoint (const char *line)
+{
+  static const char * const prefixes[] = {
+    "LOG ACTIVE", "=== SP8", "LOG END", "LOG IO_SUMMARY", "GPIO EVENT", "M1 DELIVER", "M1 STOP",
+    "D1 ERROR", "D1 BOOT HANDOFF", "D1 BOOT RETURN", "D1 RETURN", "D1 SYSTEM SELECT",
+    "D1 ENTRY_UI_PREPARE", "D1 INPUT SAMPLE_GAP", "D1 TOUCH_CONTROLLER", "D1 TOUCH_INIT_SUMMARY",
+    "D1 OSK DISPLAY_EXIT", "D1 OSK ENTRY_RETURN", "D1 EFI_INPUT_ROUTE ", "D1 PHASE BUILD=", "D1 PHASE CONFIG_IMPORT_BEGIN",
+    "D1 PHASE FRAME_DRAWN", "D1 PHASE MENU_INPUT_READY", "D1 PHASE ENTRY_CLEAR",
+    "D1 PHASE ENTRY_SCRIPT_RETURN", "D1 PHASE EFI_NAV_DELIVER"
+  };
+  unsigned i;
+  for (i = 0; i < ARRAY_SIZE (prefixes); i++)
+    if (!grub_strncmp (line, prefixes[i], grub_strlen (prefixes[i]))) return 1;
+  /* Slow-operation evidence is a checkpoint, including calls whose timing
+     includes callback work. Zero-duration query inventory remains metadata. */
+  for (i = 0; line[i]; i++)
+    if (!grub_strncmp (line + i, "elapsed_ms=", 11)
+        || !grub_strncmp (line + i, "total_ms=", 9))
+      {
+        unsigned j = i + (!grub_strncmp (line + i, "elapsed_ms=", 11) ? 11 : 9);
+        unsigned value = 0;
+        while (line[j] >= '0' && line[j] <= '9')
+          { value = value * 10 + line[j++] - '0'; if (value > 20) return 1; }
+      }
+  return 0;
 }
 
 static void
 m1_log_line (const char *line)
 {
-  grub_efi_uintn_t size, offset = 0, length = grub_strlen (line);
+  unsigned length = grub_strlen (line);
+  grub_uint64_t now;
+  if (!m1_log_file || grub_efi_is_finished) return;
+  if (length > 4 * 1024 * 1024u - m1_log_bytes - m1_log_pending_bytes - m1_log_inflight_bytes)
+    {
+      if (m1_log_busy) { m1_log_reentrant_overflow++; return; }
+      m1_log_flush_pending (); m1_log_abandon (); return;
+    }
+  if (length > sizeof (m1_log_pending) - m1_log_pending_bytes) m1_log_flush_pending ();
   if (!m1_log_file) return;
-  if (length > 4 * 1024 * 1024u - m1_log_bytes) { m1_log_abandon (); return; }
-  while (offset < length) {
-    size = length - offset;
-    if (m1_log_file->write (m1_log_file, &size, (void *) (line + offset)) != GRUB_EFI_SUCCESS ||
-        !size || size > length - offset) { m1_log_abandon (); return; }
-    offset += size; m1_log_bytes += size;
-  }
-  if (m1_log_file->flush (m1_log_file) != GRUB_EFI_SUCCESS) m1_log_abandon ();
+  if (length > sizeof (m1_log_pending) - m1_log_pending_bytes)
+    { m1_log_reentrant_overflow++; return; }
+  now = grub_get_time_ms ();
+  if (!m1_log_pending_bytes) m1_log_pending_since_ms = now;
+  grub_memcpy (m1_log_pending + m1_log_pending_bytes, line, length);
+  m1_log_pending_bytes += length;
+  if (m1_log_busy && m1_log_is_checkpoint (line)) m1_log_force_after_io = 1;
+  if (m1_log_is_checkpoint (line) || m1_log_pending_bytes >= sizeof (m1_log_pending) / 2
+      || now < m1_log_pending_since_ms || now - m1_log_pending_since_ms >= 100)
+    m1_log_flush_pending ();
+  else m1_log_metadata_lines++;
+}
+
+static void
+m1_log_poll (void)
+{
+  grub_uint64_t now;
+  if (!m1_log_file || !m1_log_pending_bytes || m1_log_busy || grub_efi_is_finished) return;
+  now = grub_get_time_ms ();
+  if (m1_log_force_after_io || now < m1_log_pending_since_ms || now - m1_log_pending_since_ms >= 100)
+    m1_log_flush_pending ();
 }
 
 static void
@@ -148,6 +260,11 @@ m1_log_start (void)
   if (m1_log_file || m1_log_attempted || grub_efi_is_finished) return;
   m1_log_attempted = 1;
   m1_log_bytes = 0;
+  m1_log_pending_bytes = m1_log_busy = m1_log_metadata_lines = 0;
+  m1_log_io_ms = m1_log_write_calls = m1_log_flush_calls = 0;
+  m1_log_max_write_ms = m1_log_max_flush_ms = m1_log_last_io_ms = m1_log_last_io_end_ms = 0;
+  m1_log_reentrant_overflow = 0;
+  m1_log_force_after_io = m1_log_drain_depth = m1_log_inflight_bytes = 0;
   m1_log_name[0] = 0;
   if (bs->locate_handle_buffer (GRUB_EFI_BY_PROTOCOL, &m1_fs_guid, NULL, &count, &handles) == GRUB_EFI_SUCCESS &&
       handles && count <= 256) {
@@ -163,7 +280,7 @@ m1_log_start (void)
   if (chosen) chosen->close (chosen);
   if (handles) bs->free_pool (handles);
   if (m1_log_file) {
-    m1_record ("LOG ACTIVE path=\\SP8-KEYDIAG\\%s UTF-8 new-file flush-per-line cap=4194304\n", m1_log_name);
+    m1_record ("LOG ACTIVE path=\\SP8-KEYDIAG\\%s UTF-8 new-file checkpoints-flush metadata-batch=4096 idle-drain-ms=100 cap=4194304\n", m1_log_name);
     m1_record ("=== SP8 GRUB GPIO %s START ===\n", SP8_LOG_VERSION);
     if (!grub_env_get ("sp8_daily_quiet"))
       grub_printf ("%s LOG ACTIVE %s\n", SP8_LOG_VERSION, m1_log_name);
@@ -176,8 +293,14 @@ m1_log_finish (const char *reason)
 {
   grub_efi_status_t status;
   if (!m1_log_file) return;
+  m1_log_flush_pending ();
+  m1_record ("LOG IO_SUMMARY write_calls=%llu flush_calls=%llu total_io_ms=%llu max_write_ms=%llu max_flush_ms=%llu metadata_lines_batched=%u pending_bytes=%u reentrant_overflow=%u excludes_own_final_checkpoint_io=1\n",
+             (unsigned long long) m1_log_write_calls, (unsigned long long) m1_log_flush_calls,
+             (unsigned long long) m1_log_io_ms, (unsigned long long) m1_log_max_write_ms,
+             (unsigned long long) m1_log_max_flush_ms, m1_log_metadata_lines,
+             m1_log_pending_bytes, m1_log_reentrant_overflow);
   m1_record ("=== SP8 GRUB GPIO %s END reason=%s ===\n", SP8_LOG_VERSION, reason);
-  m1_record ("LOG END complete=1\n");
+  m1_record ("LOG END complete=%u\n", !m1_log_reentrant_overflow);
   if (!m1_log_file) return;
   status = m1_log_file->close (m1_log_file);
   m1_log_file = NULL;

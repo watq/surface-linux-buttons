@@ -35,10 +35,15 @@ const char *grub_env_get(const char *name) {(void)name;return "1";}
 struct grub_command *grub_command_list;
 void *grub_named_list_find(grub_named_list_t list,const char *name) {(void)list;(void)name;return NULL;}
 static unsigned fake_ms,samples,blit_calls,max_height,draw_pixels;
+static unsigned compositor_available,compositor_calls,compositor_release,firmware_overlay_active,overlay_restore_capture_cycles;
+int grub_efi_console_swm_surface(unsigned width,unsigned height) {assert(width==640&&height==480);return compositor_available;}
+void grub_efi_console_release_swm(void) {compositor_release++;}
 grub_uint64_t grub_get_time_ms(void) {return fake_ms;}
 void (*grub_term_poll_input_hook)(void);
 void grub_term_poll_input(void) {samples++;}
 static unsigned char screen[640*480*4];
+static unsigned char firmware_keyboard_background[640*160*4];
+static void show_firmware_keyboard(void) {memset(screen+640*320*4,0xe7,sizeof(firmware_keyboard_background));}
 grub_video_color_t get_pixel(struct grub_video_fbblit_info *s,unsigned x,unsigned y) {
   grub_video_color_t c=0;memcpy(&c,s->data+y*s->mode_info->pitch+x*4,4);return c;
 }
@@ -51,9 +56,20 @@ static grub_efi_status_t __grub_efi_api mock_blt(struct grub_efi_gop *this,
   grub_efi_uintn_t height,grub_efi_uintn_t delta) {
   (void)this;assert(op==GRUB_EFI_BLT_BUFFER_TO_VIDEO&&delta==640*4);
   assert(dx+width<=640&&dy+height<=480);assert(sx==dx&&sy==dy);
+  if(firmware_overlay_active&&dy+height>320){
+    memcpy(screen+640*320*4,firmware_keyboard_background,sizeof(firmware_keyboard_background));
+    overlay_restore_capture_cycles++;fake_ms+=700;
+  }
   blit_calls++;draw_pixels+=width*height;max_height=height>max_height?height:max_height;fake_ms+=height/4+1;
   for(unsigned row=0;row<height;row++)memcpy(screen+(dy+row)*640*4+dx*4,(unsigned char*)buffer+(sy+row)*delta+sx*4,width*4);
+  if(firmware_overlay_active&&dy+height>320){
+    memcpy(firmware_keyboard_background,screen+640*320*4,sizeof(firmware_keyboard_background));show_firmware_keyboard();
+  }
   return GRUB_EFI_SUCCESS;
+}
+grub_efi_status_t grub_efi_console_swm_blt(struct grub_efi_gop_blt_pixel *buffer,unsigned x,unsigned y,unsigned width,unsigned height,unsigned pitch) {
+  assert(compositor_available);compositor_calls++;
+  return mock_blt(NULL,buffer,GRUB_EFI_BLT_BUFFER_TO_VIDEO,x,y,x,y,width,height,pitch);
 }
 int main(void) {
   struct grub_video_fbrender_target *display,*other;
@@ -86,5 +102,20 @@ int main(void) {
   assert(damage.x==10&&damage.y==10&&damage.width==90&&damage.height==60);
   assert(grub_video_gop_swap_buffers()==0&&!memcmp(screen,shadow,sizeof(screen)));
   puts("PASS empty updates and offscreen text-layer changes are skipped; separate screen damage rectangles merge exactly");
+  compositor_available=1;blit_calls=draw_pixels=samples=max_height=0;
+  test_fb_state.render_target=display;grub_video_fb_fill_rect(0xff333444,0,0,640,480);
+  assert(grub_video_gop_swap_buffers()==0&&compositor_calls==1&&blit_calls==1&&max_height==480&&samples>=2);
+  assert(!memcmp(screen,shadow,sizeof(screen)));
+  assert(grub_video_gop_swap_buffers()==0&&compositor_calls==1);
+  puts("PASS a firmware OSK compositor gets one exact full-frame transaction instead of60 overlapping restore/capture transactions; unchanged frames still skip");
+  firmware_overlay_active=1;memcpy(firmware_keyboard_background,shadow+640*320*4,sizeof(firmware_keyboard_background));show_firmware_keyboard();
+  overlay_restore_capture_cycles=0;compositor_calls=blit_calls=0;
+  grub_video_fb_fill_rect(0xff456789,0,0,640,480);assert(grub_video_gop_swap_buffers()==0);
+  assert(compositor_calls==1&&blit_calls==1&&overlay_restore_capture_cycles==1);
+  assert(!memcmp(screen,shadow,640*320*4));
+  assert(!memcmp(firmware_keyboard_background,shadow+640*320*4,sizeof(firmware_keyboard_background)));
+  firmware_overlay_active=0;memcpy(screen+640*320*4,firmware_keyboard_background,sizeof(firmware_keyboard_background));
+  assert(!memcmp(screen,shadow,sizeof(screen)));
+  puts("PASS active original firmware keyboard stays on top and its captured background follows the whole GRUB frame, restoring exactly after keyboard dismissal");
   grub_video_fb_track_damage(NULL);grub_free(display);grub_free(other);free(shadow);free(otherbuf);return 0;
 }
